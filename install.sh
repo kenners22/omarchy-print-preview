@@ -60,7 +60,7 @@ remove_printer() {
   ours && sudo lpadmin -x Preview
   sudo rm -f "$BACKEND"
   sudo rm -rf "$SPOOL"
-  rm -f "$STATE/default-printer"
+  rm -f "$STATE/default-printer" "$STATE/backend.sha256"
   say "Preview printer removed."
 }
 
@@ -129,12 +129,15 @@ fi
 hyprctl reload >/dev/null 2>&1 || true
 
 if [[ ${1:-} == --with-printer ]] || ours; then
-  if ! cmp -s "$HERE/print-preview-backend" "$BACKEND" 2>/dev/null; then
+  # The installed copy is root-only, so remember what we installed instead of reading it back.
+  want=$(sha256sum "$HERE/print-preview-backend" | cut -d' ' -f1)
+  if [[ ! -e $BACKEND || $(cat "$STATE/backend.sha256" 2>/dev/null) != "$want" ]]; then
     say "Installing the Preview printer's backend (needs sudo)…"
     sudo install -m 0700 -o root -g root "$HERE/print-preview-backend" "$BACKEND"
+    echo "$want" >"$STATE/backend.sha256"
   fi
-  sudo install -d -m 0755 -o root -g root "$SPOOL"
-  sudo install -d -m 0700 -o "$USER" -g "$(id -gn)" "$SPOOL/$USER"
+  [[ -d $SPOOL ]] || sudo install -d -m 0755 -o root -g root "$SPOOL"
+  [[ -d $SPOOL/$USER ]] || sudo install -d -m 0700 -o "$USER" -g "$(id -gn)" "$SPOOL/$USER"
   if ! ours; then
     # -m raw: the job arrives exactly as the app sent it (a PDF from GTK apps and Chromium)
     sudo lpadmin -p Preview -E -v print-preview:/ -m raw \
@@ -143,8 +146,10 @@ if [[ ${1:-} == --with-printer ]] || ours; then
   mkdir -p "$UNITS"
   ln -sfn "$HERE/systemd/print-preview.path" "$UNITS/print-preview.path"
   ln -sfn "$HERE/systemd/print-preview.service" "$UNITS/print-preview.service"
+  # (not `reenable`: on a linked unit its disable step deletes the link itself)
+  rm -f "$UNITS/default.target.wants/print-preview.path"  # older installs hung it here
   systemctl --user daemon-reload
-  systemctl --user reenable print-preview.path >/dev/null 2>&1
+  systemctl --user enable print-preview.path 2>&1 | grep -v '^Created symlink' || true
   systemctl --user restart print-preview.path
   if [[ $(user_default) != Preview ]]; then
     user_default >"$STATE/default-printer"  # empty = none of my own; --undo restores either way
