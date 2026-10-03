@@ -1,0 +1,6 @@
+[Unit]
+Description=Print preview for jobs sent to the "Preview" printer
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/print-preview --inbox /var/spool/print-preview/%u

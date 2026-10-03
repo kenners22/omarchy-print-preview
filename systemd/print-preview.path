@@ -1,0 +1,8 @@
+[Unit]
+Description=Open jobs sent to the "Preview" printer
+
+[Path]
+DirectoryNotEmpty=/var/spool/print-preview/%u
+
+[Install]
+WantedBy=default.target

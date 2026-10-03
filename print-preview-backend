@@ -1,0 +1,42 @@
+#!/bin/sh
+# CUPS backend for the "Preview" printer: instead of printing, it hands the job
+# to its owner's print-preview window (picked up by print-preview.path).
+# Installed by install.sh --with-printer as /usr/lib/cups/backend/print-preview, mode 0700
+# so CUPS runs it as root: it has to write into the job owner's spool folder.
+#   argv: job-id user title copies options [file]   (no file = job on stdin)
+
+if [ $# -eq 0 ]; then
+  echo 'file print-preview:/ "Print preview" "Preview before printing"'
+  exit 0
+fi
+
+user=$2
+title=$3
+file=$6
+
+# CUPS exit codes: 0 ok, 1 failed (job stays queued), 4 cancel the job.
+case $user in
+  "" | *[!A-Za-z0-9._-]*) echo "ERROR: odd user name" >&2; exit 4 ;;
+esac
+getent passwd "$user" >/dev/null || { echo "ERROR: unknown user $user" >&2; exit 4; }
+group=$(id -gn "$user") || exit 4
+
+dir=/var/spool/print-preview/$user
+install -d -m 0755 -o root -g root /var/spool/print-preview || exit 1
+install -d -m 0700 -o "$user" -g "$group" "$dir" || exit 1
+
+# Only letters, digits and . _ - space in the file name: no paths, no surprises.
+safe=$(printf '%s' "${title:-Document}" | tr -c 'A-Za-z0-9._ -' '_' | cut -c1-80)
+case $1 in *[!0-9]*) exit 4 ;; esac
+# Written next to (not inside) the watched folder, so the watcher can't wake early.
+tmp=/var/spool/print-preview/.incoming-$1
+if [ -n "$file" ]; then
+  cat -- "$file" >"$tmp" || exit 1
+else
+  cat >"$tmp" || exit 1
+fi
+chown "$user:$group" "$tmp" && chmod 0600 "$tmp" || exit 1
+# Rename last, so the watcher only ever sees whole jobs.
+mv -- "$tmp" "$dir/$(date +%s%N)-$safe" || exit 1
+echo "INFO: Sent to print preview" >&2
+exit 0

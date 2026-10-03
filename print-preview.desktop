@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Print preview
+Comment=Preview an image or PDF before printing it
+Exec=print-preview %F
+Icon=document-print-preview
+Terminal=false
+NoDisplay=true
+MimeType=image/png;image/jpeg;image/gif;image/webp;image/bmp;image/tiff;image/avif;image/heic;image/svg+xml;application/pdf;
+StartupWMClass=print-preview

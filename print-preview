@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""print-preview — preview images and PDFs before printing them.
+
+    print-preview [--more] FILE...        preview and print images / PDFs
+    print-preview --inbox DIR             open (then remove) jobs the "Preview" printer saved
+
+Opened by imv's Ctrl+P, Files' right-click "Print preview…", "Open with", and
+the "Preview" printer in every app's print dialog (install.sh --with-printer).
+
+What you see is what prints: every page is drawn into a PDF at the exact paper
+size and sent with `lp -o print-scaling=none`. On black-only (thermal) printers
+the page is first rendered at the printer's own dpi and turned into pure black
+and white, so the preview shows the real dots and barcodes stay sharp.
+
+Keys: Enter print, Esc cancel, R rotate, F fit/fill, +/- copies, O more options,
+Page Up/Down pages.
+"""
+import argparse, math, os, re, shutil, socket, subprocess, sys, tempfile, threading
+
+import gi
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Poppler", "0.18")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Poppler
+import cairo
+import numpy as np
+
+NAMED = {"A4": (595, 842), "A5": (420, 595), "A5Rotated": (595, 420), "A6": (297, 420),
+         "Letter": (612, 792), "Legal": (612, 1008)}
+# Label sizes shown first; a printer's other sizes go under "Other sizes".
+COMMON = ["w288h432", "w288h288", "w288h216", "w288h144", "w144h72", "w162h90", "A4", "A5", "A6", "Letter"]
+VIRTUAL = {"Preview"}  # our own "Preview" printer: never print back into it
+
+
+def sh(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return ""
+
+
+# Optional: an executable here makes the offline warning's button run it (with the
+# printer name), e.g. a script that re-finds a Wi-Fi printer whose address moved.
+FIX_HOOK = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "print-preview", "find-printer")
+LAST = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "print-preview", "printer")
+
+
+def printers():
+    """Real printers, and the one to start on: last used, else the CUPS default, else the first."""
+    names = [p for p in sh("lpstat", "-e").split() if p not in VIRTUAL]
+    try:
+        with open(LAST) as f:
+            last = f.read().strip()
+    except OSError:
+        last = None
+    default = (re.search(r"destination: (\S+)", sh("lpstat", "-d")) or [None, None])[1]
+    for pick in (last, default, names[0] if names else ""):
+        if pick in names or pick == "":
+            return names, pick
+    return names, ""
+
+
+def remember_printer(printer):
+    try:
+        os.makedirs(os.path.dirname(LAST), exist_ok=True)
+        with open(LAST, "w") as f:
+            f.write(printer + "\n")
+    except OSError:
+        pass
+
+
+def printer_info(printer):
+    """Paper sizes [(cups name, (w, h) pt)], default size, dpi, black-only?"""
+    opts = sh("lpoptions", "-p", printer, "-l")
+    sizes, default = [], None
+    m = re.search(r"^PageSize/[^:]*:(.*)$", opts, re.M)
+    for tok in (m[1].split() if m else []):
+        name = tok.lstrip("*")
+        wh = re.fullmatch(r"w(\d+)h(\d+)", name)
+        dims = (int(wh[1]), int(wh[2])) if wh else NAMED.get(name)
+        if dims:
+            sizes.append((name, dims))
+            if tok.startswith("*"):
+                default = name
+    if not sizes:
+        sizes = [("A4", NAMED["A4"])]
+    dpi = re.search(r"^Resolution/[^:]*:.*\*(\d+)(?:x\d+)?dpi", opts, re.M)
+    # Black-only if the driver offers no colour mode (thermal label printers, mono lasers).
+    cm = re.search(r"^ColorModel/[^:]*:(.*)$", opts, re.M)
+    mono = not cm or not re.search(r"\b\*?(RGB|CMYK|CMY|Color|Colour)\w*", cm[1], re.I)
+    return sizes, default or sizes[0][0], int(dpi[1]) if dpi else 300, mono
+
+
+def printer_status(printer):
+    """(ok, message): ok is None when we can't tell."""
+    if "disabled" in sh("lpstat", "-p", printer):
+        return False, f"{printer} is paused in CUPS."
+    m = re.search(r"socket://([^:/\s]+)(?::(\d+))?", sh("lpstat", "-v", printer))
+    if not m:
+        return None, ""
+    try:
+        socket.create_connection((m[1], int(m[2] or 9100)), timeout=2).close()
+        return True, ""
+    except OSError:
+        return False, f"{printer} isn't answering at {m[1]}."
+
+
+def size_label(name, dims):
+    if name in NAMED:
+        return name.replace("Rotated", " landscape")
+    f = lambda pt: f"{pt / 72:.2f}".rstrip("0").rstrip(".")
+    return f"{f(dims[0])} × {f(dims[1])} in"
+
+
+class ImageSource:
+    def __init__(self, pixbuf):
+        self.pixbuf = pixbuf
+        self.size = (pixbuf.get_width(), pixbuf.get_height())
+
+    def paint(self, cr):
+        Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
+        cr.get_source().set_filter(cairo.FILTER_GOOD)
+        cr.paint()
+
+
+class PdfSource:
+    def __init__(self, page):
+        self.page = page
+        self.size = page.get_size()
+
+    def paint(self, cr):
+        self.page.render_for_printing(cr)
+
+
+def load(path):
+    with open(path, "rb") as f:
+        head = f.read(1024)
+    if head.startswith(b"%!"):  # PostScript (some apps print it): convert to PDF first
+        fd, pdf = tempfile.mkstemp(prefix="print-preview-", suffix=".pdf")
+        os.close(fd)
+        try:
+            subprocess.run(["ps2pdf", path, pdf], check=True, capture_output=True, timeout=60)
+            return load(pdf)
+        finally:
+            os.unlink(pdf)
+    if b"%PDF-" in head:
+        # Read into memory so the file can go (the inbox deletes it) while pages are shown.
+        with open(path, "rb") as f:
+            data = GLib.Bytes.new(f.read())
+        doc = Poppler.Document.new_from_bytes(data, None)
+        pages = [PdfSource(doc.get_page(i)) for i in range(doc.get_n_pages())]
+        if not pages:
+            raise ValueError("the PDF has no pages")
+        return pages
+    return [ImageSource(GdkPixbuf.Pixbuf.new_from_file(path).apply_embedded_orientation())]
+
+
+BAYER = np.array([[0, 32, 8, 40, 2, 34, 10, 42], [48, 16, 56, 24, 50, 18, 58, 26],
+                  [12, 44, 4, 36, 14, 46, 6, 38], [60, 28, 52, 20, 62, 30, 54, 22],
+                  [3, 35, 11, 43, 1, 33, 9, 41], [51, 19, 59, 27, 49, 17, 57, 25],
+                  [15, 47, 7, 39, 13, 45, 5, 37], [63, 31, 55, 23, 61, 29, 53, 21]]) * 4 + 2
+
+
+def scan(grey):
+    """Barcodes zbarimg reads in a greyscale (0-255) array: [(data, x0, y0, x1, y1)]."""
+    if not shutil.which("zbarimg"):
+        return None
+    h, w = grey.shape
+    surf = cairo.ImageSurface(cairo.FORMAT_RGB24, w, h)
+    a = np.ndarray((h, surf.get_stride() // 4), np.uint32, surf.get_data())[:, :w]
+    a[:] = grey.astype(np.uint32) * 0x010101 | 0xFF000000
+    surf.mark_dirty()
+    fd, png = tempfile.mkstemp(prefix="print-preview-", suffix=".png")
+    os.close(fd)
+    try:
+        surf.write_to_png(png)
+        out = subprocess.run(["zbarimg", "-q", "--xml", png], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        os.unlink(png)
+    found = []
+    for pts, data in re.findall(r"<polygon points='([^']*)'/><data><!\[CDATA\[(.*?)\]\]></data>", out, re.S):
+        xy = [tuple(map(int, p.split(","))) for p in pts.split()]
+        xs, ys = [p[0] for p in xy], [p[1] for p in xy]
+        found.append((data, min(xs), min(ys), max(xs), max(ys)))
+    return found
+
+
+def keep_barcodes(lum, black):
+    """Make every barcode that reads in the grey page still read once it's black and white.
+
+    Squeezing an image onto the printer's dots and cutting it to black/white can
+    make bars a dot too fat or thin, enough to stop a barcode scanning. For each
+    barcode that broke, try other black/white cut-offs in just its area until it
+    reads again. Changes `black` in place; returns (scanning, found) or None.
+    """
+    want = scan(lum)
+    if not want:
+        return None
+    grey = lambda b: np.where(b, 0, 255).astype(np.uint8)
+    have = {d for d, *_ in scan(grey(black)) or []}
+    H, W = lum.shape
+    for data, x0, y0, x1, y1 in want:
+        if data in have:
+            continue
+        pad = 24  # the quiet zone either side matters to the scanner
+        ys, xs = slice(max(0, y0 - pad), min(H, y1 + pad + 1)), slice(max(0, x0 - pad), min(W, x1 + pad + 1))
+        for cut in (112, 144, 100, 160, 90, 176, 80, 192):
+            trial = lum[ys, xs] < cut
+            if data in {d for d, *_ in scan(grey(trial)) or []}:
+                black[ys, xs] = trial
+                break
+    final = {d for d, *_ in scan(grey(black)) or []}  # check the whole page as it will print
+    return sum(d in final for d, *_ in want), len(want)
+
+
+class Job:
+    """Everything the preview and the printout share."""
+
+    def __init__(self, paths, title=None):
+        self.paths = paths
+        self.title = title or ", ".join(os.path.basename(p) for p in paths)
+        self.pages = [s for p in paths for s in load(p)]
+        self.index = 0
+        self.printers, self.printer = printers()
+        self.rotate = "auto"       # auto | off | on
+        self.scale = "fit"         # fit | fill
+        self.margin_mode = "auto"  # auto | points
+        self.copies = 1
+        self._cache = {}
+        self.load_printer()
+
+    def load_printer(self):
+        if self.printer:
+            self.sizes, self.size, self.dpi, mono = printer_info(self.printer)
+        else:
+            self.sizes, self.size, self.dpi, mono = [("A4", NAMED["A4"])], "A4", 300, False
+        self.bw = ("dither" if self.looks_like_photo() else "sharp") if mono else "off"  # sharp | dither | off
+
+    def looks_like_photo(self):
+        """Mostly mid-tones (not black text on white) means dots will look better."""
+        src = self.pages[0]
+        if not isinstance(src, ImageSource):
+            return False
+        # Sample real pixels (NEAREST): blending would turn text and barcodes grey.
+        n = 256
+        pb = src.pixbuf.scale_simple(n, n, GdkPixbuf.InterpType.NEAREST)
+        px = np.frombuffer(pb.get_pixels(), np.uint8).reshape(n, pb.get_rowstride())[:, :n * pb.get_n_channels()]
+        px = px.reshape(n, n, pb.get_n_channels())[:, :, :3].astype(np.uint32)
+        lum = (px[:, :, 0] * 299 + px[:, :, 1] * 587 + px[:, :, 2] * 114) // 1000
+        return ((lum > 40) & (lum < 215)).mean() > 0.3  # labels ~0.05-0.12, photos ~0.8
+
+    @property
+    def page(self):
+        return dict(self.sizes)[self.size]
+
+    @property
+    def margin(self):  # auto: labels print edge to edge, paper gets a quarter inch
+        if self.margin_mode == "auto":
+            return 0 if self.size.startswith("w") else 18
+        return int(self.margin_mode)
+
+    def rotated(self, src):
+        (iw, ih), (pw, ph) = src.size, self.page
+        if self.rotate == "auto":
+            return (iw > ih) != (pw > ph) and abs(iw - ih) > 1
+        return self.rotate == "on"
+
+    def draw_content(self, cr, src):
+        """The page at 1 unit = 1 pt, origin top-left, in full colour."""
+        pw, ph = self.page
+        cr.save()
+        cr.rectangle(0, 0, pw, ph)
+        cr.set_source_rgb(1, 1, 1)
+        cr.fill_preserve()
+        cr.clip()
+        iw, ih = src.size
+        rot = self.rotated(src)
+        ew, eh = (ih, iw) if rot else (iw, ih)
+        m = self.margin
+        s = (max if self.scale == "fill" else min)((pw - 2 * m) / ew, (ph - 2 * m) / eh)
+        cr.translate(pw / 2, ph / 2)
+        if rot:
+            cr.rotate(math.pi / 2)
+        cr.scale(s, s)
+        cr.translate(-iw / 2, -ih / 2)
+        src.paint(cr)
+        cr.restore()
+
+    def raster(self, src):
+        """The page at the printer's dpi in pure black and white (cached)."""
+        key = (id(src), self.size, self.dpi, self.rotate, self.scale, self.margin, self.bw)
+        if key not in self._cache:
+            pw, ph = self.page
+            W, H = round(pw * self.dpi / 72), round(ph * self.dpi / 72)
+            surf = cairo.ImageSurface(cairo.FORMAT_RGB24, W, H)
+            cr = cairo.Context(surf)
+            cr.scale(self.dpi / 72, self.dpi / 72)
+            self.draw_content(cr, src)
+            surf.flush()
+            px = np.ndarray((H, surf.get_stride() // 4), np.uint32, surf.get_data())
+            v = px[:, :W]
+            lum = (((v >> 16) & 255) * 299 + ((v >> 8) & 255) * 587 + (v & 255) * 114) // 1000
+            if self.bw == "dither":
+                black = lum < np.tile(BAYER, (H // 8 + 1, W // 8 + 1))[:H, :W]
+                codes = None
+            else:
+                black = lum < 128
+                codes = keep_barcodes(lum, black)
+            v[:] = np.where(black, 0xFF000000, 0xFFFFFFFF).astype(np.uint32)
+            surf.mark_dirty()
+            self._cache = {key: (surf, codes)}  # keep just the latest page
+        return self._cache[key][0]
+
+    def barcodes(self, src):
+        """(scanning, found) for the page as it will print, or None if not checked."""
+        if self.bw == "off":
+            return None
+        self.raster(src)
+        return next(iter(self._cache.values()))[1]
+
+    def draw_page(self, cr, src, preview=False):
+        if self.bw == "off":
+            return self.draw_content(cr, src)
+        cr.save()
+        cr.scale(72 / self.dpi, 72 / self.dpi)
+        cr.set_source_surface(self.raster(src), 0, 0)
+        # On paper every dot stays a dot; on screen smooth it so it isn't jagged.
+        cr.get_source().set_filter(cairo.FILTER_GOOD if preview else cairo.FILTER_NEAREST)
+        cr.paint()
+        cr.restore()
+
+    def write_pdf(self, path):
+        pw, ph = self.page
+        surface = cairo.PDFSurface(path, pw, ph)
+        cr = cairo.Context(surface)
+        for src in self.pages:
+            self.draw_page(cr, src)
+            cr.show_page()
+        surface.finish()
+
+    def print(self):
+        fd, pdf = tempfile.mkstemp(prefix="print-preview-", suffix=".pdf")
+        os.close(fd)
+        try:
+            self.write_pdf(pdf)
+            r = subprocess.run(["lp", "-d", self.printer, "-n", str(self.copies), "-o", "collate=true",
+                                "-o", f"PageSize={self.size}", "-o", "print-scaling=none",
+                                "-t", self.title, pdf], capture_output=True, text=True, timeout=30)
+            ok, detail = r.returncode == 0, r.stderr.strip()
+        except Exception as e:
+            ok, detail = False, str(e)
+        finally:
+            os.unlink(pdf)
+        if ok:
+            remember_printer(self.printer)
+            notify(f"Printing {self.title} on {self.printer}")
+        else:
+            notify(f"Print failed: {detail}", critical=True)
+        return ok
+
+
+def page_view(job, bg, pad=20):
+    """A drawing area that shows the current page centred, scaled to fit, with a soft shadow."""
+    area = Gtk.DrawingArea(hexpand=True, vexpand=True)
+
+    def draw(widget, cr):
+        W, H = widget.get_allocated_width(), widget.get_allocated_height()
+        cr.set_source_rgb(*bg)
+        cr.paint()
+        pw, ph = job.page
+        z = min((W - 2 * pad) / pw, (H - 2 * pad) / ph)
+        x, y = (W - pw * z) / 2, (H - ph * z) / 2
+        for i, a in ((6, .06), (3, .10), (1, .18)):
+            cr.set_source_rgba(0, 0, 0, a)
+            cr.rectangle(x - i + 2, y - i + 4, pw * z + 2 * i, ph * z + 2 * i)
+            cr.fill()
+        cr.translate(x, y)
+        cr.scale(z, z)
+        job.draw_page(cr, job.pages[job.index], preview=True)
+        if area.on_drawn:
+            GLib.idle_add(area.on_drawn)
+
+    area.on_drawn = None
+    area.connect("draw", draw)
+    return area
+
+
+def combo(items, active, on_change):
+    c = Gtk.ComboBoxText()
+    for key, label in items:
+        c.append(key, label)
+    c.set_active_id(active)
+    c.connect("changed", lambda w: on_change(w.get_active_id()))
+    return c
+
+
+class Window(Gtk.Window):
+    """Minimal by default: page + one row of controls. ⋮ opens a sidebar of more options."""
+
+    W, H, SIDE = 760, 820, 300
+
+    def __init__(self, job, more=False):
+        super().__init__(title=f"Print preview — {job.title}")
+        self.job = job
+        self.all_sizes = False
+        self.set_default_size(self.W, self.H)
+        self.connect("key-press-event", self.on_key)
+        self.connect("destroy", Gtk.main_quit)
+        css = Gtk.CssProvider()
+        css.load_from_data(b".side-title { font-weight: bold; } .muted { opacity: .65; }"
+                           b" .pager { background: rgba(0,0,0,.6); border-radius: 8px; padding: 2px 6px; }"
+                           b" .pager label { color: #eee; }"
+                           b" .badge { background: rgba(0,0,0,.72); color: #eee; border-radius: 8px; padding: 4px 9px; }")
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.add(self.build(more))
+        self.check_printer()
+
+    def build(self, more):
+        j = self.job
+        outer = Gtk.Box()
+        main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+
+        self.warn = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING, no_show_all=True)
+        self.warn_text = Gtk.Label(xalign=0, wrap=True)
+        self.warn.get_content_area().add(self.warn_text)
+        self.warn_text.show()
+        self.fix_btn = self.warn.add_button("Find printer", 1)
+        self.warn.add_button("Check again", 2)
+        self.warn.connect("response", self.on_warn)
+        main.pack_start(self.warn, False, False, 0)
+
+        ov = Gtk.Overlay()
+        self.view = page_view(j, (0.16, 0.16, 0.18))
+        self.view.on_drawn = self.show_barcodes
+        ov.add(self.view)
+        self.badge = Gtk.Label(halign=Gtk.Align.START, valign=Gtk.Align.START, margin=10, no_show_all=True)
+        self.badge.get_style_context().add_class("badge")
+        ov.add_overlay(self.badge)
+        if len(j.pages) > 1:
+            pager = Gtk.Box(spacing=4, halign=Gtk.Align.CENTER, valign=Gtk.Align.END, margin_bottom=8)
+            pager.get_style_context().add_class("pager")
+            prev = Gtk.Button.new_from_icon_name("go-previous-symbolic", Gtk.IconSize.BUTTON)
+            nxt = Gtk.Button.new_from_icon_name("go-next-symbolic", Gtk.IconSize.BUTTON)
+            for b in (prev, nxt):
+                b.set_relief(Gtk.ReliefStyle.NONE)
+            prev.connect("clicked", lambda *_: self.go(-1))
+            nxt.connect("clicked", lambda *_: self.go(1))
+            self.page_label = Gtk.Label()
+            pager.pack_start(prev, False, False, 0)
+            pager.pack_start(self.page_label, False, False, 0)
+            pager.pack_start(nxt, False, False, 0)
+            ov.add_overlay(pager)
+            self.go(0)
+        main.pack_start(ov, True, True, 0)
+
+        bar = Gtk.Box(spacing=6, margin=10)
+        self.printer_combo = combo([(p, p) for p in j.printers], j.printer, self.set_printer)
+        self.printer_combo.set_tooltip_text("Printer")
+        self.paper = Gtk.ComboBoxText(tooltip_text="Paper size")
+        self.fill_paper()
+        self.paper.connect("changed", self.on_paper)
+        self.fit = Gtk.CheckButton(label="Fit whole image", active=j.scale == "fit")
+        self.fit.connect("toggled", lambda w: self.set_attr("scale", "fit" if w.get_active() else "fill"))
+        self.spin = Gtk.SpinButton.new_with_range(1, 99, 1)
+        self.spin.set_value(j.copies)
+        self.spin.set_tooltip_text("Copies")
+        self.spin.connect("value-changed", lambda w: setattr(j, "copies", w.get_value_as_int()))
+        self.more = Gtk.ToggleButton(tooltip_text="More options (O)")
+        self.more.add(Gtk.Image.new_from_icon_name("view-more-symbolic", Gtk.IconSize.BUTTON))
+        self.more.connect("toggled", lambda w: self.show_more(w.get_active()))
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: self.destroy())
+        self.print_btn = Gtk.Button(label="Print")
+        self.print_btn.get_style_context().add_class("suggested-action")
+        self.print_btn.connect("clicked", self.do_print)
+        self.print_btn.set_sensitive(bool(j.printer))
+        for w in (self.printer_combo, self.paper, self.fit):
+            bar.pack_start(w, False, False, 0)
+        bar.pack_start(Gtk.Label(label="Copies", margin_start=6), False, False, 0)
+        bar.pack_start(self.spin, False, False, 0)
+        bar.pack_start(self.more, False, False, 0)
+        bar.pack_end(self.print_btn, False, False, 0)
+        bar.pack_end(cancel, False, False, 0)
+        main.pack_start(bar, False, False, 0)
+        outer.pack_start(main, True, True, 0)
+
+        side_wrap = self.side = Gtk.Box(no_show_all=True)
+        side_wrap.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 0)
+        side = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, width_request=self.SIDE - 32, margin=16)
+        t = Gtk.Label(label="More options", xalign=0)
+        t.get_style_context().add_class("side-title")
+        side.pack_start(t, False, False, 0)
+        f = Gtk.Label(label=j.title, xalign=0, ellipsize=3)
+        f.get_style_context().add_class("muted")
+        side.pack_start(f, False, False, 4)
+        grid = Gtk.Grid(row_spacing=10, column_spacing=12)
+        self.rot_combo = combo([("auto", "Auto"), ("off", "Off"), ("on", "90°")], j.rotate, lambda v: self.set_attr("rotate", v))
+        self.margin_combo = combo([("auto", "Auto"), ("0", "None"), ("18", "¼ in"), ("36", "½ in")], j.margin_mode,
+                                  lambda v: self.set_attr("margin_mode", v))
+        self.bw_combo = combo([("sharp", "Sharp (labels)"), ("dither", "Dotted (photos)"), ("off", "Off (colour)")],
+                              j.bw, lambda v: self.set_attr("bw", v))
+        self.bw_combo.set_tooltip_text("How the page is turned into black and white for a black-only printer.\n"
+                                       "The preview shows the exact dots that will print.")
+        for i, (lbl, w) in enumerate([("Rotate", self.rot_combo), ("Margin", self.margin_combo),
+                                      ("Black & white", self.bw_combo)]):
+            grid.attach(Gtk.Label(label=lbl, xalign=0), 0, i, 1, 1)
+            w.set_hexpand(True)
+            grid.attach(w, 1, i, 1, 1)
+        side.pack_start(grid, False, False, 0)
+        keys = Gtk.Label(xalign=0)
+        keys.set_markup("<small><b>R</b> rotate · <b>F</b> fit/fill · <b>+ −</b> copies\n"
+                        "<b>O</b> options · <b>PgUp PgDn</b> pages\n<b>Enter</b> print · <b>Esc</b> cancel</small>")
+        keys.get_style_context().add_class("muted")
+        side.pack_end(keys, False, False, 0)
+        side_wrap.pack_start(side, True, True, 0)
+        outer.pack_start(side_wrap, False, False, 0)
+        for c in side_wrap.get_children():
+            c.show_all()
+        if more:
+            self.more.set_active(True)
+        return outer
+
+    def show_barcodes(self):
+        r = self.job.barcodes(self.job.pages[self.job.index])
+        if not r:
+            self.badge.hide()
+        else:
+            ok, n = r
+            word = "barcode" if n == 1 else "barcodes"
+            if ok == n:
+                self.badge.set_markup(f"<span foreground='#7fd88f'>✓</span> {n} {word} checked: will scan")
+                self.badge.set_tooltip_text("Read back from the exact dots that will print.")
+            else:
+                self.badge.set_markup(f"<span foreground='#ffb454'>⚠</span> {n - ok} of {n} {word} may not scan")
+                self.badge.set_tooltip_text("The image is too low-resolution for this label size.\n"
+                                            "Print from the original PDF label if you have it.")
+            self.badge.show()
+        return False
+
+    # --- printer status ---------------------------------------------------
+    def check_printer(self):
+        printer = self.job.printer
+        if not printer:
+            return self.show_warning(False, "No printer is set up.")
+
+        def run():
+            ok, msg = printer_status(printer)
+            GLib.idle_add(lambda: printer == self.job.printer and self.show_warning(ok, msg))
+        threading.Thread(target=run, daemon=True).start()
+
+    def show_warning(self, ok, msg):
+        if ok is False:
+            self.warn_text.set_text(msg + " It may be off, asleep, or on a new network address.")
+            hook = os.access(FIX_HOOK, os.X_OK)
+            self.fix_btn.set_label("Find printer" if hook else "Printer settings")
+            self.fix_btn.set_visible(hook or shutil.which("system-config-printer") is not None)
+            self.warn.show()
+        else:
+            self.warn.hide()
+        return False
+
+    def on_warn(self, _, response):
+        if response == 1:
+            if os.access(FIX_HOOK, os.X_OK):  # your own fixer; may ask for sudo, so in a terminal
+                self.warn_text.set_text("Looking for the printer in the terminal window…")
+                cmd = ["xdg-terminal-exec", "bash", "-c",
+                       '"$0" "$1"; echo; read -n1 -rsp "Press any key to close…"', FIX_HOOK, self.job.printer]
+            else:
+                cmd = ["system-config-printer"]
+
+            def run():
+                subprocess.run(cmd)
+                GLib.idle_add(self.check_printer)
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            self.check_printer()
+
+    # --- settings -----------------------------------------------------------
+    def go(self, step):
+        n = len(self.job.pages)
+        self.job.index = max(0, min(n - 1, self.job.index + step))
+        if hasattr(self, "page_label"):
+            self.page_label.set_text(f"Page {self.job.index + 1} of {n}")
+        self.refresh()
+
+    def show_more(self, on):
+        if not self.get_realized():
+            return self.side.set_visible(on)
+        w, h = self.get_size()
+        if on:
+            self.base_w = w
+            target = w + self.side.get_preferred_width()[1]
+        else:
+            target = getattr(self, "base_w", self.W)
+        self.side.set_visible(on)
+        # Resize only after GTK has laid out the new contents; shrinking first
+        # makes Hyprland squash the old, wider frame into the narrow window.
+        GLib.timeout_add(80, self.hypr_resize, target, h)
+
+    def hypr_resize(self, width, height):
+        # Hyprland lets a window grow by itself but not shrink, so ask it directly.
+        win = f"pid:{os.getpid()}"
+        for cmd in (f'hl.dsp.window.resize({{ window = "{win}", x = {width}, y = {height} }})',  # Lua config
+                    f"resizewindowpixel exact {width} {height},{win}"):                       # older Hyprland
+            if subprocess.run(["hyprctl", "dispatch", cmd], capture_output=True).returncode == 0:
+                return False
+        self.resize(width, height)
+        return False
+
+    def refresh(self):
+        if hasattr(self, "view"):
+            self.view.queue_draw()
+
+    def set_printer(self, p):
+        self.job.printer = p
+        self.job.load_printer()
+        self.all_sizes = False
+        self.fill_paper()
+        self.bw_combo.set_active_id(self.job.bw)
+        self.warn.hide()
+        self.check_printer()
+        self.refresh()
+
+    def fill_paper(self):
+        sizes = dict(self.job.sizes)
+        common = [n for n in COMMON if n in sizes]
+        if self.job.size not in common:
+            common.append(self.job.size)
+        shown = [n for n, _ in self.job.sizes] if self.all_sizes or len(sizes) <= 12 else common
+        self.filling = True
+        self.paper.remove_all()
+        for name in shown:
+            self.paper.append(name, size_label(name, sizes[name]))
+        if len(shown) < len(sizes):
+            self.paper.append("__other", "Other sizes…")
+        self.paper.set_active_id(self.job.size)
+        self.filling = False
+
+    def on_paper(self, w):
+        if self.filling:
+            return
+        if w.get_active_id() == "__other":
+            self.all_sizes = True
+            self.fill_paper()
+            GLib.idle_add(self.paper.popup)
+            return
+        self.set_attr("size", w.get_active_id())
+
+    def set_attr(self, attr, value):
+        if value is not None:
+            setattr(self.job, attr, value)
+            self.refresh()
+
+    def do_print(self, *_):
+        if self.job.printer and self.job.print():
+            self.destroy()
+
+    def on_key(self, _, ev):
+        k = Gdk.keyval_name(ev.keyval)
+        if k == "Escape":
+            self.destroy()
+        elif k in ("Return", "KP_Enter"):
+            self.do_print()
+        elif k in ("r", "R"):
+            order = ["auto", "on", "off"]
+            self.rot_combo.set_active_id(order[(order.index(self.job.rotate) + 1) % 3])
+        elif k in ("f", "F"):
+            self.fit.set_active(not self.fit.get_active())
+        elif k in ("o", "O"):
+            self.more.set_active(not self.more.get_active())
+        elif k in ("plus", "equal", "KP_Add"):
+            self.spin.spin(Gtk.SpinType.STEP_FORWARD, 1)
+        elif k in ("minus", "KP_Subtract"):
+            self.spin.spin(Gtk.SpinType.STEP_BACKWARD, 1)
+        elif k in ("Page_Down", "Next"):
+            self.go(1)
+        elif k in ("Page_Up", "Prior"):
+            self.go(-1)
+        else:
+            return False
+        return True
+
+
+def screenshot(job, more, out):
+    win = Window(job, more)
+    child = win.get_child()
+    win.remove(child)
+    off = Gtk.OffscreenWindow()
+    off.set_size_request(-1, Window.H)
+    win.view.set_size_request(Window.W - 20, -1)
+    off.add(child)
+    off.show_all()
+
+    def grab():
+        off.get_pixbuf().savev(out, "png", [], [])
+        Gtk.main_quit()
+    GLib.timeout_add(800, grab)
+    Gtk.main()
+
+
+def notify(msg, critical=False):
+    subprocess.run(["notify-send", "-a", "Print", *(["-u", "critical"] if critical else []), msg])
+    if critical:
+        print(msg, file=sys.stderr)
+
+
+def error(msg):
+    notify(msg, critical=True)
+
+
+def run_inbox(inbox):
+    """Show each job the "Preview" printer saved, oldest first, then delete it."""
+    work = os.path.join(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()), "print-preview")
+    os.makedirs(work, exist_ok=True)
+    while True:
+        jobs = sorted((os.path.join(inbox, f) for f in os.listdir(inbox) if not f.startswith(".")), key=os.path.getmtime)
+        if not jobs:
+            return
+        path = shutil.move(jobs[0], work)
+        title = re.sub(r"\.(pdf|ps|png|jpe?g)$", "", re.sub(r"^\d+-", "", os.path.basename(path)), flags=re.I) or "Document"
+        try:
+            Window(Job([path], title=title)).show_all()
+            Gtk.main()
+        except Exception as e:
+            error(f"Couldn't open print job {title}: {e}")
+        finally:
+            os.unlink(path)
+
+
+def main():
+    GLib.set_prgname("print-preview")
+    ap = argparse.ArgumentParser(description="Preview images and PDFs before printing them.")
+    ap.add_argument("--more", action="store_true", help="open with the options sidebar showing")
+    ap.add_argument("--inbox", metavar="DIR", help='show jobs saved by the "Preview" printer, then delete them')
+    ap.add_argument("--screenshot", help=argparse.SUPPRESS)
+    ap.add_argument("files", nargs="*")
+    a = ap.parse_args()
+    if a.inbox:
+        return run_inbox(a.inbox)
+    if not a.files:
+        ap.error("give at least one image or PDF")
+    try:
+        job = Job(a.files)
+    except Exception as e:
+        return error(f"Can't preview {', '.join(map(os.path.basename, a.files))}: {e}")
+    if a.screenshot:
+        return screenshot(job, a.more, a.screenshot)
+    Window(job, a.more).show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()

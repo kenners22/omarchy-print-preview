@@ -1,0 +1,117 @@
+# Print preview for Omarchy
+
+See what you're printing before you print it. Omarchy's image viewer (imv)
+binds `Ctrl+P` to `lp`, which sends the image straight to the printer with no
+preview and no settings. This replaces that with a small preview window, and
+can also catch `Ctrl+P → Print` from every other app.
+
+![Print preview](docs/preview.png)
+
+- **Images and PDFs**, including multi-page PDFs (and PostScript from older apps).
+- **What you see is what prints.** Each page is drawn into a PDF at the exact
+  paper size and sent with `lp -o print-scaling=none`, so the printer doesn't
+  rescale it.
+- **Thermal and black-only printers** (shipping label printers, mono lasers):
+  the page is rendered at the printer's own dpi and turned into pure black and
+  white, so the preview shows the actual dots. The tests check that the printed
+  dots match the preview exactly. Labels get a sharp cut-off; photos switch to
+  a dotted pattern on their own.
+- **Barcode check.** Shrinking a low-resolution label onto the printer's dots
+  can make bars a dot too fat or thin, enough that a barcode stops scanning.
+  Every barcode that reads on the page is read back from the black-and-white
+  dots. If one broke, its own area gets a different black/white cut-off until it
+  scans again, and a badge says so: *✓ 2 barcodes checked: will scan*, or a
+  warning if one can't be saved.
+- **Printer offline warning**, with a button for printer settings, or your own
+  script (see below).
+- One row of controls: printer, paper size (common label sizes first, the rest
+  under *Other sizes…*), *Fit whole image*, copies. `⋮` opens rotate, margin
+  and black & white options. Remembers the last printer you used.
+
+![More options](docs/options.png)
+
+## Install
+
+Needs Omarchy with Hyprland's Lua config (`~/.config/hypr/hyprland.lua`).
+
+```bash
+git clone https://github.com/kenners22/omarchy-print-preview ~/.local/share/omarchy-print-preview
+~/.local/share/omarchy-print-preview/install.sh
+```
+
+That gives you:
+
+| Where | What |
+|---|---|
+| imv | `Ctrl+P` opens the preview (a backup of `~/.config/imv/config` is kept) |
+| Files | right-click an image or PDF → **Print preview…** (restart Files once: `nautilus -q`) |
+| Anywhere | **Open with → Print preview** |
+| Terminal | `print-preview file.png label.pdf` |
+
+It installs `python-gobject python-cairo python-numpy poppler-glib zbar
+ghostscript` if any are missing. The files are linked from the clone, so
+`git pull` updates it.
+
+### Every app's Ctrl+P (optional)
+
+```bash
+~/.local/share/omarchy-print-preview/install.sh --with-printer
+```
+
+This adds a printer called **Preview** and makes it *your* default printer
+(other users are untouched). In Chromium, LibreOffice, Document Viewer and other
+apps, `Ctrl+P → Print` then opens this preview, and you print to the real
+printer from there. `lp -d <printer>` still prints directly.
+
+How it works: a CUPS backend (`/usr/lib/cups/backend/print-preview`, run as
+root by CUPS) saves each job into `/var/spool/print-preview/<you>/`, and a
+systemd user path unit opens it in the preview. Job titles are cleaned before
+they become file names. Read `print-preview-backend` before installing it: it's
+40 lines.
+
+### Undo
+
+```bash
+~/.local/share/omarchy-print-preview/install.sh --undo
+```
+
+This puts back Omarchy's own `Ctrl+P` line in imv and removes the window rules,
+links and the Preview printer. The libraries stay installed.
+
+## Keys
+
+`Enter` print · `Esc` cancel · `R` rotate · `F` fit/fill · `+`/`-` copies ·
+`O` more options · `Page Up`/`Page Down` pages
+
+## Fixing a printer that went missing
+
+When the printer doesn't answer, a bar offers **Printer settings**. If your
+printer is on Wi-Fi and its address keeps changing, put a script at
+`~/.config/print-preview/find-printer` and make it executable. The button then
+says **Find printer** and runs it in a terminal with the printer name as its
+argument, so it can rescan and repoint the queue with `lpadmin`.
+
+![Offline warning](docs/offline.png)
+
+## Tests
+
+```bash
+python3 tests.py
+```
+
+The tests never print. They make their own sample files. The black-and-white
+and barcode tests need a black-only printer set up in CUPS, plus `zint` to
+generate a barcode (`sudo pacman -S zint`).
+
+## Notes
+
+- Tested on Omarchy 4 (Hyprland 0.56, Lua config) with a 203 dpi 4×6 thermal
+  label printer using CUPS's Zebra ZPL driver. Colour printers get the page as
+  vector PDF, untouched.
+- The window floats centred at 760×820. Omarchy applies its slight window
+  transparency before a rule can drop the tag, so the rule also sets
+  `opacity = "1 1"`.
+- The Preview printer uses a raw CUPS queue (`-m raw`), which CUPS 2.4 marks as
+  deprecated but still supports.
+
+Community project, not part of Omarchy. MIT licensed.
