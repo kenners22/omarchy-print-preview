@@ -1,8 +1,11 @@
 [Unit]
 Description=Open jobs sent to the "Preview" printer
+# Only while the desktop is up: a window can't open before that.
+PartOf=graphical-session.target
+After=graphical-session.target
 
 [Path]
 DirectoryNotEmpty=/var/spool/print-preview/%u
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

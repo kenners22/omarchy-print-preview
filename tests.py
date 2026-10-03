@@ -99,6 +99,28 @@ if names:
     check("remembered printer used", pp.printers()[1] == names[-1])
 pp.LAST = real_last
 
+# --- paper names, page ranges, dialog options, zbar output, margins --------------
+check("paper: iso_a4_210x297mm", pp.media_dims("iso_a4_210x297mm") == (595.28, 841.89), pp.media_dims("iso_a4_210x297mm"))
+check("paper: na_letter_8.5x11in", pp.media_dims("na_letter_8.5x11in") == (612, 792))
+check("paper: A4.Fullbleed", pp.media_dims("A4.Fullbleed") == pp.NAMED["A4"])
+check("paper: 4x6", pp.media_dims("4x6") == (288, 432))
+check("paper: w288h432", pp.media_dims("w288h432") == (288, 432))
+check("paper: nonsense", pp.media_dims("Custom.WIDTHxHEIGHT") is None)
+check("page ranges", pp.pick_pages("1-2,4,9-", 10) == {1, 2, 4, 9, 10})
+check("page ranges junk", pp.pick_pages("x,,-", 3) == set())
+check("dialog options", pp.job_options("3\npage-ranges=2-3 media=A4 job-uuid=urn:x\n") == (3, "2-3"))
+check("dialog options empty", pp.job_options("") == (1, None))
+two = pp.Job(["two.pdf"], copies=5, page_ranges="2")
+check("job keeps only the chosen pages", len(two.pages) == 1)
+check("job takes the dialog's copies", two.copies == 5)
+xml_a = "<symbol type='CODE-128'><polygon points='+1,+2 +30,+40'/><data><![CDATA[ABC]]></data></symbol>"
+xml_b = "<symbol type='CODE-128'><data><![CDATA[ABC]]></data><polygon points='+1,+2 +30,+40'/></symbol>"
+real_run = pp.subprocess.run
+for name, xml in (("polygon first", xml_a), ("data first", xml_b)):
+    pp.subprocess.run = lambda *a, **k: type("R", (), {"stdout": xml, "returncode": 0})()
+    check(f"zbar output, {name}", pp.scan(np.full((50, 50), 255, np.uint8)) == [("ABC", 1, 2, 30, 40)])
+pp.subprocess.run = real_run
+
 # The rest needs a black-only label printer such as a thermal label printer.
 job = pp.Job(["label.png"])
 if not (job.printer and job.bw != "off"):
@@ -110,13 +132,18 @@ r = job.raster(job.pages[0])
 pw, ph = job.page
 check("raster is the page at printer dpi", (r.get_width(), r.get_height()) == (round(pw * job.dpi / 72), round(ph * job.dpi / 72)))
 check("raster is pure black and white", set(np.unique(pixels(r) & 0xFFFFFF).tolist()) <= {0, 0xFFFFFF})
-check("text label → sharp", job.bw == "sharp")
-check("photo → dotted", pp.Job(["photo.png"]).bw == "dither")
+check("text label → sharp", job.mode(job.pages[0]) == "sharp")
+photo = pp.Job(["photo.png"])
+check("photo → dotted", photo.mode(photo.pages[0]) == "dither")
 
 # --- rotation --------------------------------------------------------------------
 check("landscape image auto-rotates onto portrait label", job.rotated(job.pages[0]))
-job.rotate = "off"
+job.rotate = "0"
 check("rotate off", not job.rotated(job.pages[0]))
+for a in ("90", "180", "270"):
+    job.rotate = a
+    check(f"rotate {a}°", job.angle(job.pages[0]) == int(a))
+job.rotate = "auto"
 
 # --- PDF sent to the printer -------------------------------------------------------
 job = pp.Job(["two.pdf"])
@@ -136,6 +163,19 @@ check("printed dots match the preview exactly", got.shape == want.shape and (got
 lst = subprocess.run(["pdfimages", "-list", pdf], capture_output=True, text=True).stdout
 check("no smoothing on paper (interpolate no)", " no " in lst.splitlines()[2])
 
+# --- margins never eat the page; PDF page is a whole number of dots ---------------
+job = pp.Job(["label.png"])
+job.sizes, job.size, job.dpi = [("w144h72", (144, 72)), ("Letter", (612, 792))], "w144h72", 203
+job.margin_mode = "36"
+check("big margin on a 2x1 label is clamped", 0 <= job.margin < 36)
+job.size, job.margin_mode = "Letter", "auto"
+pdf = tempfile.mktemp(suffix=".pdf")
+job.write_pdf(pdf)
+W, H = job.dots
+lst = subprocess.run(["pdfimages", "-list", pdf], capture_output=True, text=True).stdout.splitlines()[2].split()
+check("Letter at 203 dpi: image is exactly the page in dots", (int(lst[3]), int(lst[4])) == (W, H) and lst[12] == lst[13] == "203", lst[3:5] + lst[12:14])
+os.unlink(pdf)
+
 # --- barcodes survive black and white (needs zbar; zint makes the test barcode) ----
 import shutil
 if shutil.which("zbarimg") and shutil.which("zint"):
@@ -149,7 +189,7 @@ if shutil.which("zbarimg") and shutil.which("zint"):
     check("grey barcode lost by a plain cut", not pp.scan(np.where(black, 0, 255).astype(np.uint8)))
     check("barcode check repairs it", pp.keep_barcodes(lum, black) == (1, 1))
     job = pp.Job([os.path.join(here, "docs", "example-label.png")])
-    if job.bw == "sharp":
+    if job.mode(job.pages[0]) == "sharp":
         check("example label: both barcodes scan from the printed dots", job.barcodes(job.pages[0]) == (2, 2))
 else:
     print("SKIP barcode tests: install zbar and zint")

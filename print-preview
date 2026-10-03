@@ -15,7 +15,7 @@ and white, so the preview shows the real dots and barcodes stay sharp.
 Keys: Enter print, Esc cancel, R rotate, F fit/fill, +/- copies, O more options,
 Page Up/Down pages.
 """
-import argparse, math, os, re, shutil, socket, subprocess, sys, tempfile, threading
+import argparse, math, os, re, shutil, socket, subprocess, sys, tempfile, threading, time
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -26,18 +26,21 @@ from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Poppler
 import cairo
 import numpy as np
 
-NAMED = {"A4": (595, 842), "A5": (420, 595), "A5Rotated": (595, 420), "A6": (297, 420),
-         "Letter": (612, 792), "Legal": (612, 1008)}
+NAMED = {"A3": (842, 1191), "A4": (595, 842), "A5": (420, 595), "A5Rotated": (595, 420), "A6": (297, 420),
+         "Letter": (612, 792), "Legal": (612, 1008), "Tabloid": (792, 1224), "Executive": (522, 756)}
+SPOOL = "/var/spool/print-preview"  # where the "Preview" printer's backend leaves jobs
 # Label sizes shown first; a printer's other sizes go under "Other sizes".
 COMMON = ["w288h432", "w288h288", "w288h216", "w288h144", "w144h72", "w162h90", "A4", "A5", "A6", "Letter"]
 VIRTUAL = {"Preview"}  # our own "Preview" printer: never print back into it
 
 
 def sh(*cmd):
+    """stdout, or None if the command failed or timed out (CUPS can be slow while printers wake)."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return r.stdout if r.returncode == 0 else None
     except Exception:
-        return ""
+        return None
 
 
 # Optional: an executable here makes the offline warning's button run it (with the
@@ -48,13 +51,13 @@ LAST = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.loca
 
 def printers():
     """Real printers, and the one to start on: last used, else the CUPS default, else the first."""
-    names = [p for p in sh("lpstat", "-e").split() if p not in VIRTUAL]
+    names = [p for p in (sh("lpstat", "-e") or "").split() if p not in VIRTUAL]
     try:
         with open(LAST) as f:
             last = f.read().strip()
     except OSError:
         last = None
-    default = (re.search(r"destination: (\S+)", sh("lpstat", "-d")) or [None, None])[1]
+    default = (re.search(r"destination: (\S+)", sh("lpstat", "-d") or "") or [None, None])[1]
     for pick in (last, default, names[0] if names else ""):
         if pick in names or pick == "":
             return names, pick
@@ -70,45 +73,68 @@ def remember_printer(printer):
         pass
 
 
+def media_dims(name):
+    """Size in points of a CUPS/IPP paper name: A4, A4.Fullbleed, w288h432, iso_a4_210x297mm, 4x6…"""
+    base = re.sub(r"\.[A-Za-z]+$", "", name)  # A4.Fullbleed → A4, but keep 8.5x11in whole
+    if base in NAMED:
+        return NAMED[base]
+    m = re.fullmatch(r"w(\d+(?:\.\d+)?)h(\d+(?:\.\d+)?)", base)
+    if m:
+        return float(m[1]), float(m[2])
+    m = re.search(r"(\d+(?:\.\d+)?)x(\d+(?:\.\d+)?)(mm|in)?$", base)
+    if m:
+        k = 72 / 25.4 if m[3] == "mm" else 72
+        return round(float(m[1]) * k, 2), round(float(m[2]) * k, 2)
+    return None
+
+
 def printer_info(printer):
     """Paper sizes [(cups name, (w, h) pt)], default size, dpi, black-only?"""
     opts = sh("lpoptions", "-p", printer, "-l")
+    if not opts:  # couldn't ask CUPS: assume an ordinary colour printer rather than guess "label"
+        return [("A4", NAMED["A4"]), ("Letter", NAMED["Letter"])], "A4", 300, False
     sizes, default = [], None
-    m = re.search(r"^PageSize/[^:]*:(.*)$", opts, re.M)
+    m = re.search(r"^(?:PageSize|media)/[^:]*:(.*)$", opts, re.M)
     for tok in (m[1].split() if m else []):
         name = tok.lstrip("*")
-        wh = re.fullmatch(r"w(\d+)h(\d+)", name)
-        dims = (int(wh[1]), int(wh[2])) if wh else NAMED.get(name)
-        if dims:
+        dims = media_dims(name)
+        if dims and dims[0] > 0 and dims[1] > 0:
             sizes.append((name, dims))
             if tok.startswith("*"):
                 default = name
     if not sizes:
         sizes = [("A4", NAMED["A4"])]
-    dpi = re.search(r"^Resolution/[^:]*:.*\*(\d+)(?:x\d+)?dpi", opts, re.M)
-    # Black-only if the driver offers no colour mode (thermal label printers, mono lasers).
-    cm = re.search(r"^ColorModel/[^:]*:(.*)$", opts, re.M)
-    mono = not cm or not re.search(r"\b\*?(RGB|CMYK|CMY|Color|Colour)\w*", cm[1], re.I)
+    dpi = re.search(r"^(?:Resolution|printer-resolution)/[^:]*:.*\*(\d+)(?:x\d+)?dpi", opts, re.M)
+    # Black-only if neither the driver (ColorModel) nor IPP (print-color-mode) offers colour:
+    # thermal label printers, mono lasers.
+    colour = re.compile(r"(?<![A-Za-z])\*?(RGB|CMYK|CMY|Colou?r|auto)", re.I)
+    lines = re.findall(r"^(?:ColorModel|print-color-mode)/[^:]*:(.*)$", opts, re.M)
+    mono = not any(colour.search(line) for line in lines)
     return sizes, default or sizes[0][0], int(dpi[1]) if dpi else 300, mono
 
 
+PORTS = {"socket": 9100, "ipp": 631, "ipps": 631, "http": 80, "https": 443, "lpd": 515}
+
+
 def printer_status(printer):
-    """(ok, message): ok is None when we can't tell."""
-    if "disabled" in sh("lpstat", "-p", printer):
+    """(ok, message): ok is None when we can't tell (USB, dnssd://, CUPS not answering)."""
+    if "disabled" in (sh("lpstat", "-p", printer) or ""):
         return False, f"{printer} is paused in CUPS."
-    m = re.search(r"socket://([^:/\s]+)(?::(\d+))?", sh("lpstat", "-v", printer))
+    m = re.search(r"\b(socket|ipps?|https?|lpd)://(\[[0-9A-Fa-f:.]+\]|[^:/\s\[\]]+)(?::(\d+))?", sh("lpstat", "-v", printer) or "")
     if not m:
         return None, ""
+    host = m[2].strip("[]")
     try:
-        socket.create_connection((m[1], int(m[2] or 9100)), timeout=2).close()
+        socket.create_connection((host, int(m[3] or PORTS[m[1]])), timeout=2).close()
         return True, ""
     except OSError:
-        return False, f"{printer} isn't answering at {m[1]}."
+        return False, f"{printer} isn't answering at {host}."
 
 
 def size_label(name, dims):
-    if name in NAMED:
-        return name.replace("Rotated", " landscape")
+    base, _, extra = name.partition(".") if re.search(r"\.[A-Za-z]+$", name) else (name, "", "")
+    if base in NAMED:
+        return base.replace("Rotated", " landscape") + (f" ({extra.lower()})" if extra else "")
     f = lambda pt: f"{pt / 72:.2f}".rstrip("0").rstrip(".")
     return f"{f(dims[0])} × {f(dims[1])} in"
 
@@ -181,7 +207,12 @@ def scan(grey):
     finally:
         os.unlink(png)
     found = []
-    for pts, data in re.findall(r"<polygon points='([^']*)'/><data><!\[CDATA\[(.*?)\]\]></data>", out, re.S):
+    for sym in re.findall(r"<symbol\b.*?</symbol>", out, re.S):
+        pts = re.search(r"<polygon points='([^']*)'", sym)
+        data = re.search(r"<data[^>]*><!\[CDATA\[(.*?)\]\]></data>", sym, re.S)
+        if not (pts and data):
+            continue
+        pts, data = pts[1], data[1]
         xy = [tuple(map(int, p.split(","))) for p in pts.split()]
         xs, ys = [p[0] for p in xy], [p[1] for p in xy]
         found.append((data, min(xs), min(ys), max(xs), max(ys)))
@@ -216,19 +247,35 @@ def keep_barcodes(lum, black):
     return sum(d in final for d, *_ in want), len(want)
 
 
+def pick_pages(ranges, n):
+    """Page numbers in a CUPS page-ranges value like "1-3,5,8-"."""
+    keep = set()
+    for part in str(ranges).split(","):
+        m = re.fullmatch(r"\s*(\d*)\s*(-?)\s*(\d*)\s*", part)
+        if not m or not (m[1] or m[3]):
+            continue
+        a = int(m[1] or 1)
+        b = (int(m[3]) if m[3] else n) if m[2] else a
+        keep.update(range(max(1, a), min(n, b) + 1))
+    return keep
+
+
 class Job:
     """Everything the preview and the printout share."""
 
-    def __init__(self, paths, title=None):
+    def __init__(self, paths, title=None, copies=1, page_ranges=None):
         self.paths = paths
         self.title = title or ", ".join(os.path.basename(p) for p in paths)
         self.pages = [s for p in paths for s in load(p)]
+        if page_ranges:  # e.g. "2-3,5" from an app's print dialog
+            keep = pick_pages(page_ranges, len(self.pages))
+            self.pages = [p for i, p in enumerate(self.pages, 1) if i in keep] or self.pages
         self.index = 0
         self.printers, self.printer = printers()
-        self.rotate = "auto"       # auto | off | on
+        self.rotate = "auto"       # auto | 0 | 90 | 180 | 270
         self.scale = "fit"         # fit | fill
         self.margin_mode = "auto"  # auto | points
-        self.copies = 1
+        self.copies = max(1, min(99, copies))
         self._cache = {}
         self.load_printer()
 
@@ -237,36 +284,34 @@ class Job:
             self.sizes, self.size, self.dpi, mono = printer_info(self.printer)
         else:
             self.sizes, self.size, self.dpi, mono = [("A4", NAMED["A4"])], "A4", 300, False
-        self.bw = ("dither" if self.looks_like_photo() else "sharp") if mono else "off"  # sharp | dither | off
+        self.bw = "auto" if mono else "off"  # auto (per page) | sharp | dither | off
 
-    def looks_like_photo(self):
-        """Mostly mid-tones (not black text on white) means dots will look better."""
-        src = self.pages[0]
-        if not isinstance(src, ImageSource):
-            return False
-        # Sample real pixels (NEAREST): blending would turn text and barcodes grey.
-        n = 256
-        pb = src.pixbuf.scale_simple(n, n, GdkPixbuf.InterpType.NEAREST)
-        px = np.frombuffer(pb.get_pixels(), np.uint8).reshape(n, pb.get_rowstride())[:, :n * pb.get_n_channels()]
-        px = px.reshape(n, n, pb.get_n_channels())[:, :, :3].astype(np.uint32)
-        lum = (px[:, :, 0] * 299 + px[:, :, 1] * 587 + px[:, :, 2] * 114) // 1000
-        return ((lum > 40) & (lum < 215)).mean() > 0.3  # labels ~0.05-0.12, photos ~0.8
+    def mode(self, src):
+        """How this page becomes black and white: sharp, dither or off."""
+        if self.bw != "auto":
+            return self.bw
+        self.raster(src)
+        return self._cache[self._key(src)][2]
 
     @property
     def page(self):
         return dict(self.sizes)[self.size]
 
     @property
-    def margin(self):  # auto: labels print edge to edge, paper gets a quarter inch
-        if self.margin_mode == "auto":
-            return 0 if self.size.startswith("w") else 18
-        return int(self.margin_mode)
+    def margin(self):  # auto: labels (4 in wide or less) edge to edge, paper a quarter inch
+        pw, ph = self.page
+        m = (0 if min(pw, ph) <= 300 else 18) if self.margin_mode == "auto" else int(self.margin_mode)
+        return max(0, min(m, min(pw, ph) / 2 - 9))  # never eat the whole page
+
+    def angle(self, src):
+        """Rotation in degrees for this page; auto turns it to match the paper."""
+        if self.rotate != "auto":
+            return int(self.rotate)
+        (iw, ih), (pw, ph) = src.size, self.page
+        return 90 if (iw > ih) != (pw > ph) and abs(iw - ih) > 1 else 0
 
     def rotated(self, src):
-        (iw, ih), (pw, ph) = src.size, self.page
-        if self.rotate == "auto":
-            return (iw > ih) != (pw > ph) and abs(iw - ih) > 1
-        return self.rotate == "on"
+        return self.angle(src) in (90, 270)
 
     def draw_content(self, cr, src):
         """The page at 1 unit = 1 pt, origin top-left, in full colour."""
@@ -277,24 +322,34 @@ class Job:
         cr.fill_preserve()
         cr.clip()
         iw, ih = src.size
-        rot = self.rotated(src)
-        ew, eh = (ih, iw) if rot else (iw, ih)
+        a = self.angle(src)
+        ew, eh = (ih, iw) if a in (90, 270) else (iw, ih)
         m = self.margin
         s = (max if self.scale == "fill" else min)((pw - 2 * m) / ew, (ph - 2 * m) / eh)
+        if s <= 0:
+            return cr.restore()
         cr.translate(pw / 2, ph / 2)
-        if rot:
-            cr.rotate(math.pi / 2)
+        cr.rotate(math.radians(a))
         cr.scale(s, s)
         cr.translate(-iw / 2, -ih / 2)
         src.paint(cr)
         cr.restore()
 
+    def _key(self, src):
+        return (id(src), self.size, self.dpi, self.rotate, self.scale, self.margin, self.bw)
+
+    @property
+    def dots(self):
+        """The page in printer dots. The PDF page is made exactly this many dots, so one
+        image pixel lands on one printer dot even when the paper isn't a whole number of dots."""
+        pw, ph = self.page
+        return max(1, round(pw * self.dpi / 72)), max(1, round(ph * self.dpi / 72))
+
     def raster(self, src):
         """The page at the printer's dpi in pure black and white (cached)."""
-        key = (id(src), self.size, self.dpi, self.rotate, self.scale, self.margin, self.bw)
+        key = self._key(src)
         if key not in self._cache:
-            pw, ph = self.page
-            W, H = round(pw * self.dpi / 72), round(ph * self.dpi / 72)
+            W, H = self.dots
             surf = cairo.ImageSurface(cairo.FORMAT_RGB24, W, H)
             cr = cairo.Context(surf)
             cr.scale(self.dpi / 72, self.dpi / 72)
@@ -303,15 +358,18 @@ class Job:
             px = np.ndarray((H, surf.get_stride() // 4), np.uint32, surf.get_data())
             v = px[:, :W]
             lum = (((v >> 16) & 255) * 299 + ((v >> 8) & 255) * 587 + (v & 255) * 114) // 1000
-            if self.bw == "dither":
+            mode = self.bw
+            if mode == "auto":  # mostly mid-tones (a photo) looks better as dots; labels stay sharp
+                sample = lum[::4, ::4]
+                mode = "dither" if ((sample > 40) & (sample < 215)).mean() > 0.3 else "sharp"
+            if mode == "dither":
                 black = lum < np.tile(BAYER, (H // 8 + 1, W // 8 + 1))[:H, :W]
-                codes = None
             else:
                 black = lum < 128
-                codes = keep_barcodes(lum, black)
+            codes = keep_barcodes(lum, black)  # barcodes on a photo-ish page need saving too
             v[:] = np.where(black, 0xFF000000, 0xFFFFFFFF).astype(np.uint32)
             surf.mark_dirty()
-            self._cache = {key: (surf, codes)}  # keep just the latest page
+            self._cache = {key: (surf, codes, mode)}  # keep just the latest page
         return self._cache[key][0]
 
     def barcodes(self, src):
@@ -319,7 +377,7 @@ class Job:
         if self.bw == "off":
             return None
         self.raster(src)
-        return next(iter(self._cache.values()))[1]
+        return self._cache[self._key(src)][1]
 
     def draw_page(self, cr, src, preview=False):
         if self.bw == "off":
@@ -334,6 +392,9 @@ class Job:
 
     def write_pdf(self, path):
         pw, ph = self.page
+        if self.bw != "off":
+            W, H = self.dots
+            pw, ph = W * 72 / self.dpi, H * 72 / self.dpi
         surface = cairo.PDFSurface(path, pw, ph)
         cr = cairo.Context(surface)
         for src in self.pages:
@@ -348,7 +409,7 @@ class Job:
             self.write_pdf(pdf)
             r = subprocess.run(["lp", "-d", self.printer, "-n", str(self.copies), "-o", "collate=true",
                                 "-o", f"PageSize={self.size}", "-o", "print-scaling=none",
-                                "-t", self.title, pdf], capture_output=True, text=True, timeout=30)
+                                "-t", self.title, pdf], capture_output=True, text=True, timeout=120)
             ok, detail = r.returncode == 0, r.stderr.strip()
         except Exception as e:
             ok, detail = False, str(e)
@@ -497,10 +558,10 @@ class Window(Gtk.Window):
         f.get_style_context().add_class("muted")
         side.pack_start(f, False, False, 4)
         grid = Gtk.Grid(row_spacing=10, column_spacing=12)
-        self.rot_combo = combo([("auto", "Auto"), ("off", "Off"), ("on", "90°")], j.rotate, lambda v: self.set_attr("rotate", v))
+        self.rot_combo = combo([("auto", "Auto"), ("0", "None"), ("90", "90°"), ("180", "180°"), ("270", "270°")], j.rotate, lambda v: self.set_attr("rotate", v))
         self.margin_combo = combo([("auto", "Auto"), ("0", "None"), ("18", "¼ in"), ("36", "½ in")], j.margin_mode,
                                   lambda v: self.set_attr("margin_mode", v))
-        self.bw_combo = combo([("sharp", "Sharp (labels)"), ("dither", "Dotted (photos)"), ("off", "Off (colour)")],
+        self.bw_combo = combo([("auto", "Auto"), ("sharp", "Sharp (labels)"), ("dither", "Dotted (photos)"), ("off", "Off (colour)")],
                               j.bw, lambda v: self.set_attr("bw", v))
         self.bw_combo.set_tooltip_text("How the page is turned into black and white for a black-only printer.\n"
                                        "The preview shows the exact dots that will print.")
@@ -665,8 +726,8 @@ class Window(Gtk.Window):
         elif k in ("Return", "KP_Enter"):
             self.do_print()
         elif k in ("r", "R"):
-            order = ["auto", "on", "off"]
-            self.rot_combo.set_active_id(order[(order.index(self.job.rotate) + 1) % 3])
+            order = ["auto", "90", "180", "270", "0"]
+            self.rot_combo.set_active_id(order[(order.index(self.job.rotate) + 1) % len(order)])
         elif k in ("f", "F"):
             self.fit.set_active(not self.fit.get_active())
         elif k in ("o", "O"):
@@ -711,23 +772,69 @@ def error(msg):
     notify(msg, critical=True)
 
 
+def job_options(text):
+    """Copies and page range an app chose in its print dialog (CUPS backend argv 4 and 5)."""
+    import shlex
+    copies, opts = 1, {}
+    lines = text.splitlines()
+    if lines and lines[0].strip().isdigit():
+        copies = int(lines[0])
+    try:
+        words = shlex.split(lines[1]) if len(lines) > 1 else []
+    except ValueError:
+        words = lines[1].split()
+    for w in words:
+        k, _, v = w.partition("=")
+        opts[k] = v
+    return copies, opts.get("page-ranges")
+
+
 def run_inbox(inbox):
-    """Show each job the "Preview" printer saved, oldest first, then delete it."""
-    work = os.path.join(os.environ.get("XDG_RUNTIME_DIR", tempfile.gettempdir()), "print-preview")
-    os.makedirs(work, exist_ok=True)
-    while True:
-        jobs = sorted((os.path.join(inbox, f) for f in os.listdir(inbox) if not f.startswith(".")), key=os.path.getmtime)
-        if not jobs:
-            return
-        path = shutil.move(jobs[0], work)
-        title = re.sub(r"\.(pdf|ps|png|jpe?g)$", "", re.sub(r"^\d+-", "", os.path.basename(path)), flags=re.I) or "Document"
-        try:
-            Window(Job([path], title=title)).show_all()
-            Gtk.main()
-        except Exception as e:
-            error(f"Couldn't open print job {title}: {e}")
-        finally:
-            os.unlink(path)
+    """Show each job the "Preview" printer saved, oldest first. A job is only deleted
+    after its window has been shown and closed; one that can't be opened is kept in
+    ~/.local/state/print-preview/failed/ (and you're told)."""
+    # Wait for the desktop: just after login the session may not be ready yet.
+    for _ in range(15):
+        if Gtk.init_check()[0]:
+            break
+        time.sleep(2)
+    else:
+        print("print-preview: no display, leaving jobs where they are", file=sys.stderr)
+        sys.exit(1)
+    state = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "print-preview")
+    failed = os.path.join(state, "failed")
+    work = tempfile.mkdtemp(prefix="print-preview-", dir=os.environ.get("XDG_RUNTIME_DIR"))  # 0700, fresh
+    try:
+        while True:
+            entries = sorted((e for e in os.scandir(inbox) if not e.name.startswith(".")),
+                             key=lambda e: e.stat(follow_symlinks=False).st_mtime)
+            if not entries:
+                return
+            entry = entries[0]
+            title = re.sub(r"^\d+-(\d+-)?", "", entry.name)
+            title = re.sub(r"\.(pdf|ps|png|jpe?g)$", "", title, flags=re.I) or "Document"
+            path = shutil.move(entry.path, work)  # out of the spool, so it isn't picked up twice
+            try:
+                if os.path.isdir(path) and not os.path.islink(path):  # job + options from the backend
+                    doc = os.path.join(path, "job")
+                    try:
+                        with open(os.path.join(path, "options")) as f:
+                            copies, ranges = job_options(f.read())
+                    except OSError:
+                        copies, ranges = 1, None
+                elif os.path.isfile(path) and not os.path.islink(path):
+                    doc, copies, ranges = path, 1, None
+                else:
+                    raise ValueError("not a print job")
+                Window(Job([doc], title=title, copies=copies, page_ranges=ranges)).show_all()
+                Gtk.main()
+                shutil.rmtree(path) if os.path.isdir(path) else os.unlink(path)
+            except Exception as e:
+                os.makedirs(failed, exist_ok=True)
+                shutil.move(path, failed)
+                error(f"Couldn't open print job {title}: {e}. It's kept in {failed}.")
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 
 def main():
@@ -739,7 +846,11 @@ def main():
     ap.add_argument("files", nargs="*")
     a = ap.parse_args()
     if a.inbox:
-        return run_inbox(a.inbox)
+        # Only the Preview printer's own spool folder: this mode deletes what it shows.
+        mine = os.path.join(SPOOL, os.environ.get("USER") or "")
+        if os.path.realpath(a.inbox) != os.path.realpath(mine):
+            ap.error(f"--inbox only works on {mine}")
+        return run_inbox(mine)
     if not a.files:
         ap.error("give at least one image or PDF")
     try:

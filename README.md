@@ -14,8 +14,8 @@ can also catch `Ctrl+P → Print` from every other app.
 - **Thermal and black-only printers** (shipping label printers, mono lasers):
   the page is rendered at the printer's own dpi and turned into pure black and
   white, so the preview shows the actual dots. The tests check that the printed
-  dots match the preview exactly. Labels get a sharp cut-off; photos switch to
-  a dotted pattern on their own.
+  dots match the preview exactly. Each page is judged on its own: labels get a
+  sharp cut-off, photos a dotted pattern.
 - **Barcode check.** Shrinking a low-resolution label onto the printer's dots
   can make bars a dot too fat or thin, enough that a barcode stops scanning.
   Every barcode that reads on the page is read back from the black-and-white
@@ -25,8 +25,9 @@ can also catch `Ctrl+P → Print` from every other app.
 - **Printer offline warning**, with a button for printer settings, or your own
   script (see below).
 - One row of controls: printer, paper size (common label sizes first, the rest
-  under *Other sizes…*), *Fit whole image*, copies. `⋮` opens rotate, margin
-  and black & white options. Remembers the last printer you used.
+  under *Other sizes…*), *Fit whole image*, copies. `⋮` opens rotate (auto, 0,
+  90, 180, 270°), margin and black & white options. Remembers the last printer
+  you used.
 
 ![More options](docs/options.png)
 
@@ -61,13 +62,24 @@ ghostscript` if any are missing. The files are linked from the clone, so
 This adds a printer called **Preview** and makes it *your* default printer
 (other users are untouched). In Chromium, LibreOffice, Document Viewer and other
 apps, `Ctrl+P → Print` then opens this preview, and you print to the real
-printer from there. `lp -d <printer>` still prints directly.
+printer from there. The copies and page range you picked in the app's dialog
+carry over. `lp -d <printer>` still prints directly.
+
+It won't take over a printer that's already called Preview. Only the user who
+ran the install gets the preview; anyone else printing to Preview is told it
+isn't set up for them, rather than the job vanishing. A job that can't be
+opened is kept in `~/.local/state/print-preview/failed/` and you get a
+notification.
 
 How it works: a CUPS backend (`/usr/lib/cups/backend/print-preview`, run as
 root by CUPS) saves each job into `/var/spool/print-preview/<you>/`, and a
-systemd user path unit opens it in the preview. Job titles are cleaned before
-they become file names. Read `print-preview-backend` before installing it: it's
-40 lines.
+systemd user path unit (part of the graphical session) opens it in the preview.
+Job titles are cleaned before they become file names, jobs over 512 MB are
+refused, and each job is moved in whole so nothing half-written is ever opened.
+Read `print-preview-backend` before installing it: it's short.
+
+The backend is a root-owned copy, so after `git pull`, run `./install.sh` again
+to update it (it only asks for sudo if the backend changed).
 
 ### Undo
 
@@ -75,8 +87,9 @@ they become file names. Read `print-preview-backend` before installing it: it's
 ~/.local/share/omarchy-print-preview/install.sh --undo
 ```
 
-This puts back Omarchy's own `Ctrl+P` line in imv and removes the window rules,
-links and the Preview printer. The libraries stay installed.
+This puts back the `Ctrl+P` line imv had before (yours, or Omarchy's), your
+previous default printer, and removes the window rules, links and the Preview
+printer. The libraries stay installed.
 
 ## Keys
 
@@ -106,8 +119,16 @@ generate a barcode (`sudo pacman -S zint`).
 ## Notes
 
 - Tested on Omarchy 4 (Hyprland 0.56, Lua config) with a 203 dpi 4×6 thermal
-  label printer using CUPS's Zebra ZPL driver. Colour printers get the page as
-  vector PDF, untouched.
+  label printer using CUPS's Zebra ZPL driver. On colour printers the page is
+  redrawn as a PDF at the chosen size and placement (vector stays vector); it is
+  not the app's original file, so print-specific extras like ICC profiles or
+  overprint aren't carried over.
+- Paper sizes come from the printer's PPD or IPP names (`A4`, `w288h432`,
+  `iso_a4_210x297mm`, `na_letter_8.5x11in`, `4x6`…). If CUPS doesn't answer,
+  the preview assumes an ordinary colour printer rather than guessing.
+- Offline detection works for `socket://`, `ipp(s)://`, `http(s)://` and
+  `lpd://` printers (IPv6 too). USB and `dnssd://` printers show no warning.
+- Multi-page TIFFs show only the first page.
 - The window floats centred at 760×820. Omarchy applies its slight window
   transparency before a rule can drop the tag, so the rule also sets
   `opacity = "1 1"`.

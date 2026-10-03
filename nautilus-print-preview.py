@@ -19,7 +19,7 @@ class PrintPreviewAction(GObject.GObject, Nautilus.MenuProvider):
         for file in files:
             location = file.get_location()
             path = location.get_path() if location else None
-            if not path or not file.get_mime_type().startswith(PRINTABLE):
+            if not path or not (file.get_mime_type() or "").startswith(PRINTABLE):
                 return []
             paths.append(path)
         if not paths or not command:

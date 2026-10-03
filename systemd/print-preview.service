@@ -1,5 +1,6 @@
 [Unit]
 Description=Print preview for jobs sent to the "Preview" printer
+After=graphical-session.target
 
 [Service]
 Type=simple

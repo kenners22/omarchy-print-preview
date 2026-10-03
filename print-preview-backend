@@ -1,42 +1,67 @@
 #!/bin/sh
 # CUPS backend for the "Preview" printer: instead of printing, it hands the job
 # to its owner's print-preview window (picked up by print-preview.path).
-# Installed by install.sh --with-printer as /usr/lib/cups/backend/print-preview, mode 0700
-# so CUPS runs it as root: it has to write into the job owner's spool folder.
+# Installed by install.sh --with-printer as /usr/lib/cups/backend/print-preview,
+# mode 0700, so CUPS runs it as root: it writes into the job owner's spool folder.
 #   argv: job-id user title copies options [file]   (no file = job on stdin)
+#
+# Each job lands as one folder, <time>-<job id>-<title>/ holding "job" (the
+# document) and "options" (copies, then the CUPS options such as page-ranges).
+# The folder is built in a root-only staging area and moved in whole, so the
+# watcher never sees half a job.
 
 if [ $# -eq 0 ]; then
   echo 'file print-preview:/ "Print preview" "Preview before printing"'
   exit 0
 fi
 
+job=$1
 user=$2
 title=$3
+copies=$4
+options=$5
 file=$6
+SPOOL=/var/spool/print-preview
+MAX_BYTES=536870912  # 512 MB: a job bigger than this is refused, not left to fill /var
 
 # CUPS exit codes: 0 ok, 1 failed (job stays queued), 4 cancel the job.
+case $job in "" | *[!0-9]*) echo "ERROR: odd job id" >&2; exit 4 ;; esac
+case $copies in "" | *[!0-9]*) copies=1 ;; esac
 case $user in
-  "" | *[!A-Za-z0-9._-]*) echo "ERROR: odd user name" >&2; exit 4 ;;
+  "" | *[!A-Za-z0-9._-]* | .*) echo "ERROR: odd user name" >&2; exit 4 ;;
 esac
 getent passwd "$user" >/dev/null || { echo "ERROR: unknown user $user" >&2; exit 4; }
 group=$(id -gn "$user") || exit 4
 
-dir=/var/spool/print-preview/$user
-install -d -m 0755 -o root -g root /var/spool/print-preview || exit 1
-install -d -m 0700 -o "$user" -g "$group" "$dir" || exit 1
-
-# Only letters, digits and . _ - space in the file name: no paths, no surprises.
-safe=$(printf '%s' "${title:-Document}" | tr -c 'A-Za-z0-9._ -' '_' | cut -c1-80)
-case $1 in *[!0-9]*) exit 4 ;; esac
-# Written next to (not inside) the watched folder, so the watcher can't wake early.
-tmp=/var/spool/print-preview/.incoming-$1
-if [ -n "$file" ]; then
-  cat -- "$file" >"$tmp" || exit 1
-else
-  cat >"$tmp" || exit 1
+# install.sh --with-printer makes this folder for the user who set Preview up.
+# Anyone else would have their job vanish, so refuse it with a reason instead.
+dir=$SPOOL/$user
+if [ ! -d "$dir" ] || [ -L "$dir" ]; then
+  echo "ERROR: Print preview isn't set up for $user (run install.sh --with-printer)" >&2
+  exit 4
 fi
-chown "$user:$group" "$tmp" && chmod 0600 "$tmp" || exit 1
-# Rename last, so the watcher only ever sees whole jobs.
-mv -- "$tmp" "$dir/$(date +%s%N)-$safe" || exit 1
+
+# Only letters, digits and . _ - space in the name: no paths, no surprises.
+safe=$(printf '%s' "${title:-Document}" | tr -c 'A-Za-z0-9._ -' '_' | cut -c1-80)
+stage=$SPOOL/.incoming-$job
+rm -rf -- "$stage"
+mkdir -m 0700 -- "$stage" || exit 1
+trap 'rm -rf -- "$stage"' EXIT
+
+if [ -n "$file" ]; then
+  head -c $((MAX_BYTES + 1)) -- "$file" >"$stage/job" || exit 1
+else
+  head -c $((MAX_BYTES + 1)) >"$stage/job" || exit 1
+fi
+if [ "$(stat -c %s -- "$stage/job")" -gt "$MAX_BYTES" ]; then
+  echo "ERROR: job is over 512 MB" >&2
+  exit 4
+fi
+printf '%s\n%s\n' "$copies" "$options" >"$stage/options" || exit 1
+
+chown -R "$user:$group" "$stage" && chmod 0600 "$stage/job" "$stage/options" || exit 1
+# rename(2) into the user's folder: atomic, and it doesn't follow a symlink planted there.
+mv -T -- "$stage" "$dir/$(date +%s)-$job-$safe" || exit 1
+trap - EXIT
 echo "INFO: Sent to print preview" >&2
 exit 0

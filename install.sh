@@ -4,10 +4,11 @@
 #   ./install.sh                  Ctrl+P in imv, Files right-click, Open with
 #   ./install.sh --with-printer   also a "Preview" printer, so Ctrl+P → Print in
 #                                 any app (Chromium, LibreOffice…) opens the preview
-#   ./install.sh --undo           take everything back out
+#   ./install.sh --undo           take everything back out, as it was before
 #
-# Runs from wherever you cloned it (files are linked, so `git pull` updates it).
-# Only the libraries and the optional printer need sudo.
+# Runs from wherever you cloned it. The app is linked, so `git pull` updates it;
+# re-run ./install.sh after a pull to update the printer backend too (it's a
+# root-owned copy).
 set -euo pipefail
 
 HERE=$(cd -- "$(dirname -- "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
@@ -17,6 +18,7 @@ DESKTOP=~/.local/share/applications/print-preview.desktop
 IMV=~/.config/imv/config
 HYPR=~/.config/hypr/hyprland.lua
 UNITS=~/.config/systemd/user
+STATE=${XDG_STATE_HOME:-~/.local/state}/omarchy-print-preview
 BACKEND=/usr/lib/cups/backend/print-preview
 SPOOL=/var/spool/print-preview
 DEPS=(python-gobject python-cairo python-numpy poppler-glib zbar ghostscript)
@@ -26,19 +28,39 @@ BEGIN='-- >>> omarchy-print-preview'
 END='-- <<< omarchy-print-preview'
 
 say() { printf '\e[1m%s\e[0m\n' "$*"; }
+user_default() { sed -n 's/^Default \([^ ]*\).*/\1/p' ~/.cups/lpoptions 2>/dev/null | tail -1; }
+ours() { lpstat -v Preview 2>/dev/null | grep -q 'print-preview:/$'; }
+
+# Put a saved imv line back (or Omarchy's own if we never saved one).
+restore_imv() {
+  [[ -f $IMV ]] || return 0
+  local saved=$STOCK_PRINT
+  [[ -f $STATE/imv-ctrl-p ]] && saved=$(cat "$STATE/imv-ctrl-p")
+  if [[ $saved == none ]]; then
+    sed -i '/^<Ctrl+p> = exec print-preview /d' "$IMV"
+  else
+    local line=${saved//\\/\\\\}; line=${line//&/\\&}; line=${line//|/\\|}
+    sed -i "s|^<Ctrl+p> = exec print-preview .*|$line|" "$IMV"
+  fi
+}
 
 remove_printer() {
-  [[ -e $BACKEND ]] || lpstat -v Preview &>/dev/null || return 0
+  ours || [[ -e $BACKEND ]] || return 0
   systemctl --user disable --now print-preview.path 2>/dev/null || true
   rm -f "$UNITS/print-preview.path" "$UNITS/print-preview.service"
   systemctl --user daemon-reload
-  if lpstat -d 2>/dev/null | grep -q ': Preview$'; then
-    real=$(lpstat -e | grep -vx Preview | head -1 || true)
-    [[ -n $real ]] && lpoptions -d "$real" >/dev/null
+  if [[ $(user_default) == Preview ]]; then
+    prev=$(cat "$STATE/default-printer" 2>/dev/null || true)
+    if [[ -n $prev ]] && lpstat -v "$prev" &>/dev/null; then
+      lpoptions -d "$prev" >/dev/null
+    else  # there was no personal default before: drop ours, the system one applies again
+      sed -i '/^Default Preview\b/d' ~/.cups/lpoptions
+    fi
   fi
-  sudo lpadmin -x Preview 2>/dev/null || true
+  ours && sudo lpadmin -x Preview
   sudo rm -f "$BACKEND"
   sudo rm -rf "$SPOOL"
+  rm -f "$STATE/default-printer"
   say "Preview printer removed."
 }
 
@@ -47,14 +69,22 @@ if [[ ${1:-} == --undo ]]; then
   rm -f "$NAUTILUS" "$DESKTOP"
   [[ -L $BIN ]] && rm -f "$BIN"
   update-desktop-database ~/.local/share/applications 2>/dev/null || true
-  # imv: back to Omarchy's own Ctrl+P (print straight away)
-  [[ -f $IMV ]] && sed -i "s|^<Ctrl+p> = exec print-preview .*|$STOCK_PRINT|" "$IMV"
-  [[ -f $HYPR ]] && sed -i "/^$BEGIN\$/,/^$END\$/d" "$HYPR" && { hyprctl reload >/dev/null 2>&1 || true; }
+  restore_imv
+  # Only our own block, and only if both markers are there (never "to the end of the file").
+  if [[ -f $HYPR ]] && grep -qx -- "$BEGIN" "$HYPR" && grep -qx -- "$END" "$HYPR"; then
+    sed -i "/^$BEGIN\$/,/^$END\$/d" "$HYPR"
+    hyprctl reload >/dev/null 2>&1 || true
+  fi
+  rm -rf "$STATE"
   say "Print preview removed. (Libraries stay installed.)"
   exit 0
 fi
 
 [[ -f $HYPR ]] || { echo "This needs Omarchy with Hyprland's Lua config ($HYPR)." >&2; exit 1; }
+if [[ ${1:-} == --with-printer ]] && lpstat -v Preview &>/dev/null && ! ours; then
+  echo "There's already a printer called Preview that isn't this one; not touching it." >&2
+  exit 1
+fi
 
 missing=()
 for p in "${DEPS[@]}"; do pacman -Q "$p" &>/dev/null || missing+=("$p"); done
@@ -63,17 +93,21 @@ if (( ${#missing[@]} )); then
   sudo pacman -S --needed --noconfirm "${missing[@]}"
 fi
 
+mkdir -p "$STATE" "$(dirname "$BIN")" "$(dirname "$NAUTILUS")" "$(dirname "$DESKTOP")"
 chmod +x "$HERE/print-preview"
-mkdir -p "$(dirname "$BIN")" "$(dirname "$NAUTILUS")" "$(dirname "$DESKTOP")"
 ln -sfn "$HERE/print-preview" "$BIN"
 ln -sfn "$HERE/nautilus-print-preview.py" "$NAUTILUS"
 ln -sfn "$HERE/print-preview.desktop" "$DESKTOP"
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
-# imv: Ctrl+P opens the preview instead of printing straight away
+# imv: Ctrl+P opens the preview instead of printing straight away.
+# The line it replaces is saved once, so --undo can put it back exactly.
 mkdir -p "$(dirname "$IMV")"
 [[ -f $IMV ]] || cp "${OMARCHY_PATH:-/usr/share/omarchy}/config/imv/config" "$IMV" 2>/dev/null || printf '[binds]\n' >"$IMV"
-cp "$IMV" "$IMV.bak.$(date +%s)"
+if ! grep -q '^<Ctrl+p> = exec print-preview ' "$IMV"; then
+  grep -m1 '^<Ctrl+p> =' "$IMV" >"$STATE/imv-ctrl-p" || echo none >"$STATE/imv-ctrl-p"
+  cp "$IMV" "$IMV.bak.print-preview"
+fi
 if grep -q '^<Ctrl+p> =' "$IMV"; then
   sed -i "s|^<Ctrl+p> = .*|${OUR_PRINT//&/\\&}|" "$IMV"
 else
@@ -83,7 +117,7 @@ fi
 
 # Hyprland: float it centred at a size that suits a page, and keep it solid
 # (Omarchy applies its slight transparency before a tag can be dropped).
-if ! grep -q "^$BEGIN\$" "$HYPR"; then
+if ! grep -qx -- "$BEGIN" "$HYPR"; then
   cat >>"$HYPR" <<EOF
 
 $BEGIN
@@ -94,23 +128,31 @@ EOF
 fi
 hyprctl reload >/dev/null 2>&1 || true
 
-if [[ ${1:-} == --with-printer ]]; then
-  say "Adding the Preview printer (needs sudo)…"
-  sudo install -m 0700 -o root -g root "$HERE/print-preview-backend" "$BACKEND"
+if [[ ${1:-} == --with-printer ]] || ours; then
+  if ! cmp -s "$HERE/print-preview-backend" "$BACKEND" 2>/dev/null; then
+    say "Installing the Preview printer's backend (needs sudo)…"
+    sudo install -m 0700 -o root -g root "$HERE/print-preview-backend" "$BACKEND"
+  fi
   sudo install -d -m 0755 -o root -g root "$SPOOL"
   sudo install -d -m 0700 -o "$USER" -g "$(id -gn)" "$SPOOL/$USER"
-  # -m raw: the job arrives exactly as the app sent it (a PDF from GTK apps and Chromium)
-  sudo lpadmin -p Preview -E -v print-preview:/ -m raw \
-    -D "Print preview" -L "Opens the preview; print to the real printer from there" 2>&1 | grep -vi deprecat || true
+  if ! ours; then
+    # -m raw: the job arrives exactly as the app sent it (a PDF from GTK apps and Chromium)
+    sudo lpadmin -p Preview -E -v print-preview:/ -m raw \
+      -D "Print preview" -L "Opens the preview; print to the real printer from there" 2>&1 | grep -vi deprecat || true
+  fi
   mkdir -p "$UNITS"
   ln -sfn "$HERE/systemd/print-preview.path" "$UNITS/print-preview.path"
   ln -sfn "$HERE/systemd/print-preview.service" "$UNITS/print-preview.service"
   systemctl --user daemon-reload
-  systemctl --user enable --now print-preview.path
-  lpoptions -d Preview >/dev/null  # your default only; `lp -d <printer>` still prints direct
+  systemctl --user reenable print-preview.path >/dev/null 2>&1
+  systemctl --user restart print-preview.path
+  if [[ $(user_default) != Preview ]]; then
+    user_default >"$STATE/default-printer"  # empty = none of my own; --undo restores either way
+    lpoptions -d Preview >/dev/null         # my default only; `lp -d <printer>` still prints direct
+  fi
 fi
 
 pgrep -x nautilus >/dev/null && echo "Restart Files (nautilus -q) to get the right-click item."
 say "Done. Open an image in imv and press Ctrl+P."
-[[ ${1:-} == --with-printer ]] && say "Ctrl+P → Print in any app now opens the preview too."
+ours && say "Ctrl+P → Print in any app opens the preview too."
 echo "Undo: $HERE/install.sh --undo"
