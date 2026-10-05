@@ -81,6 +81,12 @@ Read `print-preview-backend` before installing it: it's short.
 The backend is a root-owned copy, so after `git pull`, run `./install.sh` again
 to update it (it only asks for sudo if the backend changed).
 
+To take just the Preview printer back out (keeping imv, Files and Open with):
+
+```bash
+~/.local/share/omarchy-print-preview/install.sh --no-printer
+```
+
 ### Undo
 
 ```bash

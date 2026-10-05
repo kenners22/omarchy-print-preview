@@ -4,6 +4,7 @@
 #   ./install.sh                  Ctrl+P in imv, Files right-click, Open with
 #   ./install.sh --with-printer   also a "Preview" printer, so Ctrl+P → Print in
 #                                 any app (Chromium, LibreOffice…) opens the preview
+#   ./install.sh --no-printer     remove just the "Preview" printer (keeps the rest)
 #   ./install.sh --undo           take everything back out, as it was before
 #
 # Runs from wherever you cloned it. The app is linked, so `git pull` updates it;
@@ -63,6 +64,11 @@ remove_printer() {
   rm -f "$STATE/default-printer" "$STATE/backend.sha256" "$STATE/ppd.sha256"
   say "Preview printer removed."
 }
+
+if [[ ${1:-} == --no-printer ]]; then
+  remove_printer
+  exit 0
+fi
 
 if [[ ${1:-} == --undo ]]; then
   remove_printer
