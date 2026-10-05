@@ -48,6 +48,7 @@ That gives you:
 | Files | right-click an image or PDF → **Print preview…** (restart Files once: `nautilus -q`) |
 | Anywhere | **Open with → Print preview** |
 | Terminal | `print-preview file.png label.pdf` |
+| Print dialogs | the **Preview** button in GTK print dialogs (Document Viewer, LibreOffice, Files…) opens this preview instead of GNOME's full-screen one (`gtk-print-preview-command` in `~/.config/gtk-3.0/settings.ini` and `gtk-4.0/`) |
 
 It installs `python-gobject python-cairo python-numpy poppler-glib zbar
 ghostscript` if any are missing. The files are linked from the clone, so
@@ -64,6 +65,13 @@ This adds a printer called **Preview** and makes it *your* default printer
 apps, `Ctrl+P → Print` then opens this preview, and you print to the real
 printer from there. The copies and page range you picked in the app's dialog
 carry over. `lp -d <printer>` still prints directly.
+
+Chromium normally reopens on the last printer you used, which skips the preview
+once you've printed straight to a real printer. So the install also adds a
+browser policy (`/etc/chromium/policies/managed/omarchy-print-preview.json`,
+and Chrome's equivalent if Chrome is installed) that makes Chromium start on
+the default printer, Preview, every time. You can still pick another printer
+in Chromium's list.
 
 It won't take over a printer that's already called Preview. Only the user who
 ran the install gets the preview; anyone else printing to Preview is told it
@@ -88,8 +96,9 @@ to update it (it only asks for sudo if the backend changed).
 ```
 
 This puts back the `Ctrl+P` line imv had before (yours, or Omarchy's), your
-previous default printer, and removes the window rules, links and the Preview
-printer. The libraries stay installed.
+previous default printer and any previous GTK preview command, and removes the
+window rules, links, the Chromium policy and the Preview printer. The libraries
+stay installed.
 
 ## Keys
 

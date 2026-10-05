@@ -2,6 +2,7 @@
 """print-preview — preview images and PDFs before printing them.
 
     print-preview [--more] FILE...        preview and print images / PDFs
+    print-preview --unlink-tempfile FILE  the same, then delete FILE (GTK print dialog's Preview button)
     print-preview --inbox DIR             open (then remove) jobs the "Preview" printer saved
 
 Opened by imv's Ctrl+P, Files' right-click "Print preview…", "Open with", and
@@ -842,6 +843,8 @@ def main():
     ap = argparse.ArgumentParser(description="Preview images and PDFs before printing them.")
     ap.add_argument("--more", action="store_true", help="open with the options sidebar showing")
     ap.add_argument("--inbox", metavar="DIR", help='show jobs saved by the "Preview" printer, then delete them')
+    ap.add_argument("--unlink-tempfile", action="store_true",
+                    help="delete the files when the window closes (for the GTK print dialog's Preview button)")
     ap.add_argument("--screenshot", help=argparse.SUPPRESS)
     ap.add_argument("files", nargs="*")
     a = ap.parse_args()
@@ -854,13 +857,21 @@ def main():
     if not a.files:
         ap.error("give at least one image or PDF")
     try:
-        job = Job(a.files)
-    except Exception as e:
-        return error(f"Can't preview {', '.join(map(os.path.basename, a.files))}: {e}")
-    if a.screenshot:
-        return screenshot(job, a.more, a.screenshot)
-    Window(job, a.more).show_all()
-    Gtk.main()
+        try:
+            job = Job(a.files)
+        except Exception as e:
+            return error(f"Can't preview {', '.join(map(os.path.basename, a.files))}: {e}")
+        if a.screenshot:
+            return screenshot(job, a.more, a.screenshot)
+        Window(job, a.more).show_all()
+        Gtk.main()
+    finally:
+        if a.unlink_tempfile:  # GTK leaves its temporary PDF for the previewer to remove
+            for f in a.files:
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

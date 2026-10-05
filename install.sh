@@ -1,9 +1,11 @@
 #!/bin/bash
 # Print preview for Omarchy.
 #
-#   ./install.sh                  Ctrl+P in imv, Files right-click, Open with
+#   ./install.sh                  Ctrl+P in imv, Files right-click, Open with, and the
+#                                 Preview button in GTK print dialogs (instead of GNOME's)
 #   ./install.sh --with-printer   also a "Preview" printer, so Ctrl+P → Print in
-#                                 any app (Chromium, LibreOffice…) opens the preview
+#                                 any app (Chromium, LibreOffice…) opens the preview,
+#                                 and Chromium always starts on it (a browser policy)
 #   ./install.sh --undo           take everything back out, as it was before
 #
 # Runs from wherever you cloned it. The app is linked, so `git pull` updates it;
@@ -25,7 +27,43 @@ DEPS=(python-gobject python-cairo python-numpy poppler-glib zbar ghostscript)
 STOCK_PRINT='<Ctrl+p> = exec lp "$imv_current_file"'
 OUR_PRINT='<Ctrl+p> = exec print-preview "$imv_current_file" &'
 BEGIN='-- >>> omarchy-print-preview'
+GTK_KEY=gtk-print-preview-command
+GTK_CMD='print-preview --unlink-tempfile %f'
+GTK_INIS=(~/.config/gtk-3.0/settings.ini ~/.config/gtk-4.0/settings.ini)
+# Chromium remembers the last printer used; this policy makes it start on the
+# system default (the Preview printer) every time instead.
+POLICY_DIRS=(/etc/chromium/policies/managed /etc/opt/chrome/policies/managed)
+POLICY_FILE=omarchy-print-preview.json
 END='-- <<< omarchy-print-preview'
+
+# GTK print dialogs' Preview button runs $GTK_KEY from settings.ini. Set it to
+# ours, saving any previous value once so --undo can put it back.
+set_gtk_preview() {
+  local ini saved
+  for ini in "${GTK_INIS[@]}"; do
+    saved=$STATE/$(basename "$(dirname "$ini")")-preview-command
+    mkdir -p "$(dirname "$ini")" "$STATE"
+    [[ -f $ini ]] || printf '[Settings]\n' >"$ini"
+    grep -q '^\[Settings\]' "$ini" || printf '\n[Settings]\n' >>"$ini"
+    if [[ ! -f $saved ]]; then
+      sed -n "s/^$GTK_KEY *= *//p" "$ini" | head -1 >"$saved"  # empty = wasn't set
+    fi
+    sed -i "/^$GTK_KEY *=/d" "$ini"
+    sed -i "/^\[Settings\]/a $GTK_KEY=$GTK_CMD" "$ini"
+  done
+}
+
+restore_gtk_preview() {
+  local ini saved prev
+  for ini in "${GTK_INIS[@]}"; do
+    saved=$STATE/$(basename "$(dirname "$ini")")-preview-command
+    [[ -f $ini ]] && grep -q "^$GTK_KEY=$GTK_CMD\$" "$ini" || { rm -f "$saved"; continue; }
+    sed -i "/^$GTK_KEY *=/d" "$ini"
+    prev=$(cat "$saved" 2>/dev/null || true)
+    [[ -n $prev ]] && sed -i "/^\[Settings\]/a $GTK_KEY=$prev" "$ini"
+    rm -f "$saved"
+  done
+}
 
 say() { printf '\e[1m%s\e[0m\n' "$*"; }
 user_default() { sed -n 's/^Default \([^ ]*\).*/\1/p' ~/.cups/lpoptions 2>/dev/null | tail -1; }
@@ -44,6 +82,11 @@ restore_imv() {
   fi
 }
 
+policy_browser() { [[ $1 == /etc/chromium/* ]] && echo Chromium || echo Chrome; }
+browser_installed() {
+  if [[ $1 == /etc/chromium/* ]]; then command -v chromium >/dev/null; else command -v google-chrome-stable >/dev/null; fi
+}
+
 remove_printer() {
   ours || [[ -e $BACKEND ]] || return 0
   systemctl --user disable --now print-preview.path 2>/dev/null || true
@@ -57,6 +100,9 @@ remove_printer() {
       sed -i '/^Default Preview\b/d' ~/.cups/lpoptions
     fi
   fi
+  for dir in "${POLICY_DIRS[@]}"; do
+    [[ -f $dir/$POLICY_FILE ]] && sudo rm -f "$dir/$POLICY_FILE"
+  done
   ours && sudo lpadmin -x Preview
   sudo rm -f "$BACKEND"
   sudo rm -rf "$SPOOL"
@@ -66,6 +112,7 @@ remove_printer() {
 
 if [[ ${1:-} == --undo ]]; then
   remove_printer
+  restore_gtk_preview
   rm -f "$NAUTILUS" "$DESKTOP"
   [[ -L $BIN ]] && rm -f "$BIN"
   update-desktop-database ~/.local/share/applications 2>/dev/null || true
@@ -98,6 +145,10 @@ chmod +x "$HERE/print-preview"
 ln -sfn "$HERE/print-preview" "$BIN"
 ln -sfn "$HERE/nautilus-print-preview.py" "$NAUTILUS"
 ln -sfn "$HERE/print-preview.desktop" "$DESKTOP"
+
+# GTK print dialogs (Papers/Evince, LibreOffice, Files…): their Preview button
+# opens this preview instead of GNOME's full-screen one.
+set_gtk_preview
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
 # imv: Ctrl+P opens the preview instead of printing straight away.
@@ -155,6 +206,15 @@ if [[ ${1:-} == --with-printer ]] || ours; then
     user_default >"$STATE/default-printer"  # empty = none of my own; --undo restores either way
     lpoptions -d Preview >/dev/null         # my default only; `lp -d <printer>` still prints direct
   fi
+  # Chromium / Chrome: start every print on the default (Preview), not the last printer used.
+  for dir in "${POLICY_DIRS[@]}"; do
+    browser_installed "$dir" || continue
+    if [[ ! -f $dir/$POLICY_FILE ]]; then
+      say "Making $(policy_browser "$dir") start on the Preview printer (needs sudo)…"
+      sudo install -d -m 0755 "$dir"
+      echo '{ "PrintPreviewUseSystemDefaultPrinter": true }' | sudo tee "$dir/$POLICY_FILE" >/dev/null
+    fi
+  done
 fi
 
 pgrep -x nautilus >/dev/null && echo "Restart Files (nautilus -q) to get the right-click item."
