@@ -52,7 +52,12 @@ LAST = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.loca
 
 def printers():
     """Real printers, and the one to start on: last used, else the CUPS default, else the first."""
-    names = [p for p in (sh("lpstat", "-e") or "").split() if p not in VIRTUAL]
+    # Installed queues only: `lpstat -e` also lists printers CUPS merely found on
+    # the network, so a printer you've set up shows twice. Those discovered ones
+    # are only used when nothing is installed.
+    installed = [l.split()[0] for l in (sh("lpstat", "-a") or "").splitlines() if l.strip()]
+    found = (sh("lpstat", "-e") or "").split()
+    names = [p for p in (installed if set(installed) - VIRTUAL else found) if p not in VIRTUAL]
     try:
         with open(LAST) as f:
             last = f.read().strip()
