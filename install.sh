@@ -60,7 +60,7 @@ remove_printer() {
   ours && sudo lpadmin -x Preview
   sudo rm -f "$BACKEND"
   sudo rm -rf "$SPOOL"
-  rm -f "$STATE/default-printer" "$STATE/backend.sha256"
+  rm -f "$STATE/default-printer" "$STATE/backend.sha256" "$STATE/ppd.sha256"
   say "Preview printer removed."
 }
 
@@ -138,10 +138,17 @@ if [[ ${1:-} == --with-printer ]] || ours; then
   fi
   [[ -d $SPOOL ]] || sudo install -d -m 0755 -o root -g root "$SPOOL"
   [[ -d $SPOOL/$USER ]] || sudo install -d -m 0700 -o "$USER" -g "$(id -gn)" "$SPOOL/$USER"
+  # A small PPD rather than a raw queue: apps like Chromium need paper sizes
+  # before they'll print to it. Jobs still pass through untouched (see the PPD).
+  ppd=$(sha256sum "$HERE/print-preview.ppd" | cut -d' ' -f1)
   if ! ours; then
-    # -m raw: the job arrives exactly as the app sent it (a PDF from GTK apps and Chromium)
-    sudo lpadmin -p Preview -E -v print-preview:/ -m raw \
+    sudo lpadmin -p Preview -E -v print-preview:/ -P "$HERE/print-preview.ppd" \
       -D "Print preview" -L "Opens the preview; print to the real printer from there" 2>&1 | grep -vi deprecat || true
+    echo "$ppd" >"$STATE/ppd.sha256"
+  elif [[ $(cat "$STATE/ppd.sha256" 2>/dev/null) != "$ppd" ]]; then
+    say "Updating the Preview printer's description (needs sudo)…"
+    sudo lpadmin -p Preview -P "$HERE/print-preview.ppd" 2>&1 | grep -vi deprecat || true
+    echo "$ppd" >"$STATE/ppd.sha256"
   fi
   mkdir -p "$UNITS"
   ln -sfn "$HERE/systemd/print-preview.path" "$UNITS/print-preview.path"

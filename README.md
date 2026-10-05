@@ -132,7 +132,14 @@ generate a barcode (`sudo pacman -S zint`).
 - The window floats centred at 760×820. Omarchy applies its slight window
   transparency before a rule can drop the tag, so the rule also sets
   `opacity = "1 1"`.
-- The Preview printer uses a raw CUPS queue (`-m raw`), which CUPS 2.4 marks as
-  deprecated but still supports.
+- The Preview printer has a small PPD (`print-preview.ppd`: A4, Letter, A5,
+  4×6) instead of being a raw queue. Chromium's own print screen calls a raw
+  queue "not available" because it lists no paper sizes. The PPD passes PDF and
+  PostScript through untouched, so the preview still gets exactly what the app
+  sent. CUPS 2.4 marks PPDs as deprecated but still supports them.
+- To skip Chromium's print screen entirely, start Chromium with
+  `--kiosk-printing` (add it to `~/.config/chromium-flags.conf`) and give it the
+  policy `PrintPreviewUseSystemDefaultPrinter`. Ctrl+P, or a site's "Print
+  label" button, then goes straight into this preview.
 
 Community project, not part of Omarchy. MIT licensed.
