@@ -5,7 +5,7 @@
 #                                 Preview button in GTK print dialogs (instead of GNOME's)
 #   ./install.sh --with-printer   also a "Preview" printer, so Ctrl+P → Print in
 #                                 any app (Chromium, LibreOffice…) opens the preview,
-#                                 and Chromium uses the same system print dialog
+#                                 and Chromium always starts on it (a browser policy)
 #   ./install.sh --undo           take everything back out, as it was before
 #
 # Runs from wherever you cloned it. The app is linked, so `git pull` updates it;
@@ -30,12 +30,10 @@ BEGIN='-- >>> omarchy-print-preview'
 GTK_KEY=gtk-print-preview-command
 GTK_CMD='print-preview --unlink-tempfile %f'
 GTK_INIS=(~/.config/gtk-3.0/settings.ini ~/.config/gtk-4.0/settings.ini)
-# Chromium has its own print screen; this policy makes Ctrl+P open the same
-# system print dialog every other app uses, starting on the default printer
-# (Preview) rather than the last one used.
+# Chromium remembers the last printer used; this policy makes it start on the
+# system default (the Preview printer) every time instead.
 POLICY_DIRS=(/etc/chromium/policies/managed /etc/opt/chrome/policies/managed)
 POLICY_FILE=omarchy-print-preview.json
-POLICY='{ "DisablePrintPreview": true, "PrintPreviewUseSystemDefaultPrinter": true }'
 END='-- <<< omarchy-print-preview'
 
 # GTK print dialogs' Preview button runs $GTK_KEY from settings.ini. Set it to
@@ -208,13 +206,13 @@ if [[ ${1:-} == --with-printer ]] || ours; then
     user_default >"$STATE/default-printer"  # empty = none of my own; --undo restores either way
     lpoptions -d Preview >/dev/null         # my default only; `lp -d <printer>` still prints direct
   fi
-  # Chromium / Chrome: Ctrl+P opens the system print dialog, starting on Preview.
+  # Chromium / Chrome: start every print on the default (Preview), not the last printer used.
   for dir in "${POLICY_DIRS[@]}"; do
     browser_installed "$dir" || continue
-    if [[ $(cat "$dir/$POLICY_FILE" 2>/dev/null) != "$POLICY" ]]; then
-      say "Making $(policy_browser "$dir") use the system print dialog (needs sudo)…"
+    if [[ ! -f $dir/$POLICY_FILE ]]; then
+      say "Making $(policy_browser "$dir") start on the Preview printer (needs sudo)…"
       sudo install -d -m 0755 "$dir"
-      echo "$POLICY" | sudo tee "$dir/$POLICY_FILE" >/dev/null
+      echo '{ "PrintPreviewUseSystemDefaultPrinter": true }' | sudo tee "$dir/$POLICY_FILE" >/dev/null
     fi
   done
 fi

@@ -66,13 +66,12 @@ apps, `Ctrl+P → Print` then opens this preview, and you print to the real
 printer from there. The copies and page range you picked in the app's dialog
 carry over. `lp -d <printer>` still prints directly.
 
-Chromium has its own print screen, unlike every other app. So the install also
-adds a browser policy (`/etc/chromium/policies/managed/omarchy-print-preview.json`,
-and Chrome's equivalent if Chrome is installed) with `DisablePrintPreview`, so
-Chromium's Ctrl+P opens the same system print dialog as everything else, and
-`PrintPreviewUseSystemDefaultPrinter`, so it starts on Preview. One dialog
-everywhere: pick a real printer to print straight away, or leave it on Preview
-and press Print to get this preview.
+Chromium normally reopens on the last printer you used, which skips the preview
+once you've printed straight to a real printer. So the install also adds a
+browser policy (`/etc/chromium/policies/managed/omarchy-print-preview.json`,
+and Chrome's equivalent if Chrome is installed) that makes Chromium start on
+the default printer, Preview, every time. You can still pick another printer
+in Chromium's list.
 
 It won't take over a printer that's already called Preview. Only the user who
 ran the install gets the preview; anyone else printing to Preview is told it
