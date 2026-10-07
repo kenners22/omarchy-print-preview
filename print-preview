@@ -3,6 +3,7 @@
 
     print-preview [--more] FILE...        preview and print images / PDFs
     print-preview --unlink-tempfile FILE  the same, then delete FILE (GTK print dialog's Preview button)
+    print-preview --active-window         preview the document open in the focused viewer window
     print-preview --inbox DIR             open (then remove) jobs the "Preview" printer saved
 
 Opened by imv's Ctrl+P, Files' right-click "Print preview…", "Open with", and
@@ -16,7 +17,7 @@ and white, so the preview shows the real dots and barcodes stay sharp.
 Keys: Enter print, Esc cancel, R rotate, F fit/fill, +/- copies, O more options,
 Page Up/Down pages.
 """
-import argparse, math, os, re, shutil, socket, subprocess, sys, tempfile, threading, time
+import argparse, math, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, urllib.parse, urllib.request
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -50,14 +51,29 @@ FIX_HOOK = os.path.join(os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/
 LAST = os.path.join(os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")), "print-preview", "printer")
 
 
+def installed_printers():
+    """Queues set up in CUPS, from its web page on localhost (instant). lpstat
+    spends a second browsing the network before it answers, every time."""
+    try:
+        with urllib.request.urlopen("http://localhost:631/printers/", timeout=3) as r:
+            page = r.read().decode("utf-8", "replace")
+        names = list(dict.fromkeys(re.findall(r'href="/printers/([^"/?#]+)"', page, re.I)))
+        if names:
+            return [urllib.parse.unquote(n) for n in names]
+    except Exception:
+        pass
+    return re.findall(r"^device for ([^:\s]+):", sh("lpstat", "-v") or "", re.M)
+
+
 def printers():
     """Real printers, and the one to start on: last used, else the CUPS default, else the first."""
     # Installed queues only: `lpstat -e` also lists printers CUPS merely found on
     # the network, so a printer you've set up shows twice. Those discovered ones
     # are only used when nothing is installed.
-    installed = [l.split()[0] for l in (sh("lpstat", "-a") or "").splitlines() if l.strip()]
-    found = (sh("lpstat", "-e") or "").split()
-    names = [p for p in (installed if set(installed) - VIRTUAL else found) if p not in VIRTUAL]
+    installed = installed_printers()
+    if not set(installed) - VIRTUAL:
+        installed = (sh("lpstat", "-e") or "").split()
+    names = [p for p in installed if p not in VIRTUAL]
     try:
         with open(LAST) as f:
             last = f.read().strip()
@@ -94,9 +110,35 @@ def media_dims(name):
     return None
 
 
+def ppd_options(printer):
+    """The printer's options in `lpoptions -l` form ("PageSize/Media Size: A4 *Letter"),
+    read from the PPD that CUPS serves on localhost. lpoptions itself spends a second
+    browsing the network first, every time. None if the printer has no PPD here."""
+    url = f"http://localhost:631/printers/{urllib.parse.quote(printer)}.ppd"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as r:
+            ppd = r.read().decode("latin-1")
+    except Exception:
+        return None
+    mine = {}  # this user's own defaults (`lpoptions -p X -o key=value`) win, as with lpoptions
+    try:
+        for line in open(os.path.expanduser("~/.cups/lpoptions")):
+            f = line.split()
+            if len(f) > 2 and f[0] in ("Dest", "Default") and f[1] == printer:
+                mine.update(o.split("=", 1) for o in f[2:] if "=" in o)
+    except OSError:
+        pass
+    out = []
+    for key, text, body in re.findall(r"^\*OpenUI \*([^/:\s]+)(?:/([^:]*))?:.*?$(.*?)^\*CloseUI", ppd, re.M | re.S):
+        default = mine.get(key) or (re.search(rf"^\*Default{key}:\s*(\S+)", ppd, re.M) or [None, None])[1]
+        choices = re.findall(rf"^\*{key}\s+([^/:\s]+)", body, re.M)
+        out.append(f"{key}/{text or key}: " + " ".join(("*" if c == default else "") + c for c in choices))
+    return "\n".join(out) + "\n" if out else None
+
+
 def printer_info(printer):
     """Paper sizes [(cups name, (w, h) pt)], default size, dpi, black-only?"""
-    opts = sh("lpoptions", "-p", printer, "-l")
+    opts = ppd_options(printer) or sh("lpoptions", "-p", printer, "-l")
     if not opts:  # couldn't ask CUPS: assume an ordinary colour printer rather than guess "label"
         return [("A4", NAMED["A4"]), ("Letter", NAMED["Letter"])], "A4", 300, False
     sizes, default = [], None
@@ -883,6 +925,39 @@ def run_inbox(inbox):
         shutil.rmtree(work, ignore_errors=True)
 
 
+def active_document():
+    """The file shown in the focused window (Ctrl+P in a document viewer).
+    Viewers keep the file open, so look at what its process has open, and pick
+    the one whose name starts the window title ("file.pdf — Title")."""
+    import json
+    win = json.loads(sh("hyprctl", "activewindow", "-j") or "{}")
+    pid, title = win.get("pid"), win.get("title") or ""
+    if not pid:
+        return None
+    found = []
+    try:
+        args = open(f"/proc/{pid}/cmdline", "rb").read().split(b"\0")[1:]
+        found += [a.decode(errors="replace") for a in args if a]
+    except OSError:
+        pass
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                found.append(os.readlink(f"/proc/{pid}/fd/{fd}"))
+            except OSError:
+                pass
+    except OSError:
+        pass
+    docs = []
+    for f in found:
+        if f.startswith("file://"):
+            f = GLib.filename_from_uri(f)[0]
+        if os.path.isfile(f) and f.lower().endswith((".pdf", ".ps", ".png", ".jpg", ".jpeg", ".tif", ".tiff")) and f not in docs:
+            docs.append(f)
+    named = [d for d in docs if title.startswith(os.path.basename(d))]
+    return (named or docs or [None])[0]
+
+
 def main():
     GLib.set_prgname("print-preview")
     ap = argparse.ArgumentParser(description="Preview images and PDFs before printing them.")
@@ -890,9 +965,16 @@ def main():
     ap.add_argument("--inbox", metavar="DIR", help='show jobs saved by the "Preview" printer, then delete them')
     ap.add_argument("--unlink-tempfile", action="store_true",
                     help="delete the files when the window closes (for the GTK print dialog's Preview button)")
+    ap.add_argument("--active-window", action="store_true",
+                    help="preview the document open in the focused window (bound to Ctrl+P in document viewers)")
     ap.add_argument("--screenshot", help=argparse.SUPPRESS)
     ap.add_argument("files", nargs="*")
     a = ap.parse_args()
+    if a.active_window:
+        doc = active_document()
+        if not doc:
+            return error("Couldn't tell which file this window has open. Use its print dialog instead.")
+        a.files = [doc]
     if a.inbox:
         # Only the Preview printer's own spool folder: this mode deletes what it shows.
         mine = os.path.join(SPOOL, os.environ.get("USER") or "")
