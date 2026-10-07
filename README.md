@@ -48,6 +48,7 @@ That gives you:
 | Files | right-click an image or PDF → **Print preview…** (restart Files once: `nautilus -q`) |
 | Anywhere | **Open with → Print preview** |
 | Terminal | `print-preview file.png label.pdf` |
+| Print dialogs | the **Preview** button in GTK print dialogs (Document Viewer, LibreOffice, Files…) opens this preview instead of GNOME's full-screen one; **Print** still prints as before |
 
 It installs `python-gobject python-cairo python-numpy poppler-glib zbar
 ghostscript` if any are missing. The files are linked from the clone, so
@@ -94,8 +95,8 @@ To take just the Preview printer back out (keeping imv, Files and Open with):
 ```
 
 This puts back the `Ctrl+P` line imv had before (yours, or Omarchy's), your
-previous default printer, and removes the window rules, links and the Preview
-printer. The libraries stay installed.
+previous default printer and any previous GTK preview command, and removes the
+window rules, links and the Preview printer. The libraries stay installed.
 
 ## Keys
 

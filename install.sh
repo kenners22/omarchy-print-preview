@@ -1,7 +1,8 @@
 #!/bin/bash
 # Print preview for Omarchy.
 #
-#   ./install.sh                  Ctrl+P in imv, Files right-click, Open with
+#   ./install.sh                  Ctrl+P in imv, Files right-click, Open with, and the
+#                                 Preview button in GTK print dialogs (instead of GNOME's)
 #   ./install.sh --with-printer   also a "Preview" printer, so Ctrl+P → Print in
 #                                 any app (Chromium, LibreOffice…) opens the preview
 #   ./install.sh --no-printer     remove just the "Preview" printer (keeps the rest)
@@ -26,7 +27,41 @@ DEPS=(python-gobject python-cairo python-numpy poppler-glib zbar ghostscript)
 STOCK_PRINT='<Ctrl+p> = exec lp "$imv_current_file"'
 OUR_PRINT='<Ctrl+p> = exec print-preview "$imv_current_file" &'
 BEGIN='-- >>> omarchy-print-preview'
+GTK_KEY=gtk-print-preview-command
+GTK_CMD='print-preview --unlink-tempfile %f'
+GTK_INIS=(~/.config/gtk-3.0/settings.ini ~/.config/gtk-4.0/settings.ini)
 END='-- <<< omarchy-print-preview'
+
+# GTK print dialogs' Preview button runs $GTK_KEY from settings.ini. Point it
+# at this preview, saving any previous value once so --undo can put it back.
+set_gtk_preview() {
+  local ini saved
+  for ini in "${GTK_INIS[@]}"; do
+    saved=$STATE/$(basename "$(dirname "$ini")")-preview-command
+    mkdir -p "$(dirname "$ini")" "$STATE"
+    [[ -f $ini ]] || printf '[Settings]\n' >"$ini"
+    grep -q '^\[Settings\]' "$ini" || printf '\n[Settings]\n' >>"$ini"
+    if [[ ! -f $saved ]]; then  # empty = wasn't set; never save our own value as "previous"
+      sed -n "s/^$GTK_KEY *= *//p" "$ini" | head -1 | grep -vxF "$GTK_CMD" >"$saved" || true
+    fi
+    sed -i "/^$GTK_KEY *=/d" "$ini"
+    sed -i "/^\[Settings\]/a $GTK_KEY=$GTK_CMD" "$ini"
+  done
+}
+
+restore_gtk_preview() {
+  local ini saved prev
+  for ini in "${GTK_INIS[@]}"; do
+    saved=$STATE/$(basename "$(dirname "$ini")")-preview-command
+    [[ -f $ini ]] && grep -qxF "$GTK_KEY=$GTK_CMD" "$ini" || { rm -f "$saved"; continue; }
+    sed -i "/^$GTK_KEY *=/d" "$ini"
+    prev=$(cat "$saved" 2>/dev/null || true)
+    [[ -n $prev ]] && sed -i "/^\[Settings\]/a $GTK_KEY=$prev" "$ini"
+    # drop a settings.ini we created that's now just its header
+    [[ $(grep -cv '^\s*$' "$ini") == 1 ]] && grep -qx '\[Settings\]' "$ini" && rm -f "$ini"
+    rm -f "$saved"
+  done
+}
 
 say() { printf '\e[1m%s\e[0m\n' "$*"; }
 user_default() { sed -n 's/^Default \([^ ]*\).*/\1/p' ~/.cups/lpoptions 2>/dev/null | tail -1; }
@@ -72,6 +107,7 @@ fi
 
 if [[ ${1:-} == --undo ]]; then
   remove_printer
+  restore_gtk_preview
   rm -f "$NAUTILUS" "$DESKTOP"
   [[ -L $BIN ]] && rm -f "$BIN"
   update-desktop-database ~/.local/share/applications 2>/dev/null || true
@@ -104,6 +140,10 @@ chmod +x "$HERE/print-preview"
 ln -sfn "$HERE/print-preview" "$BIN"
 ln -sfn "$HERE/nautilus-print-preview.py" "$NAUTILUS"
 ln -sfn "$HERE/print-preview.desktop" "$DESKTOP"
+
+# GTK print dialogs (Document Viewer, LibreOffice, Files…): their Preview button
+# opens this preview instead of GNOME's full-screen one. Print still prints.
+set_gtk_preview
 update-desktop-database ~/.local/share/applications 2>/dev/null || true
 
 # imv: Ctrl+P opens the preview instead of printing straight away.
