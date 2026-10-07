@@ -3,7 +3,8 @@
 See what you're printing before you print it. Omarchy's image viewer (imv)
 binds `Ctrl+P` to `lp`, which sends the image straight to the printer with no
 preview and no settings. This replaces that with a small preview window, and
-can also catch `Ctrl+P → Print` from every other app.
+gives document viewers' `Ctrl+P` and GTK print dialogs' Preview button the same
+window. One small Rust program (GTK 4, Poppler, Cairo).
 
 ![Print preview](docs/preview.png)
 
@@ -48,41 +49,15 @@ That gives you:
 | Files | right-click an image or PDF → **Print preview…** (restart Files once: `nautilus -q`) |
 | Anywhere | **Open with → Print preview** |
 | Terminal | `print-preview file.png label.pdf` |
+| Document viewers | `Ctrl+P` in Document Viewer (Evince) or Papers opens this preview on the open file, skipping the print dialog. Other apps get `Ctrl+P` as usual (the binding passes it on, as Omarchy's universal copy/paste does). |
 | Print dialogs | the **Preview** button in GTK print dialogs (Document Viewer, LibreOffice, Files…) opens this preview instead of GNOME's full-screen one; **Print** still prints as before |
 
-It installs `python-gobject python-cairo python-numpy poppler-glib zbar
-ghostscript` if any are missing. The files are linked from the clone, so
-`git pull` updates it.
+It installs `gtk4 poppler-glib ghostscript`, and Rust if you don't have it,
+then builds the app in the clone and links it into `~/.local/bin`. After
+`git pull`, run `./install.sh` again to rebuild.
 
-### Every app's Ctrl+P (optional)
-
-```bash
-~/.local/share/omarchy-print-preview/install.sh --with-printer
-```
-
-This adds a printer called **Preview** and makes it *your* default printer
-(other users are untouched). In Chromium, LibreOffice, Document Viewer and other
-apps, `Ctrl+P → Print` then opens this preview, and you print to the real
-printer from there. The copies and page range you picked in the app's dialog
-carry over. `lp -d <printer>` still prints directly.
-
-It won't take over a printer that's already called Preview. Only the user who
-ran the install gets the preview; anyone else printing to Preview is told it
-isn't set up for them, rather than the job vanishing. A job that can't be
-opened is kept in `~/.local/state/print-preview/failed/` and you get a
-notification.
-
-How it works: a CUPS backend (`/usr/lib/cups/backend/print-preview`, run as
-root by CUPS) saves each job into `/var/spool/print-preview/<you>/`, and a
-systemd user path unit (part of the graphical session) opens it in the preview.
-Job titles are cleaned before they become file names, jobs over 512 MB are
-refused, and each job is moved in whole so nothing half-written is ever opened.
-Read `print-preview-backend` before installing it: it's short.
-
-The backend is a root-owned copy, so after `git pull`, run `./install.sh` again
-to update it (it only asks for sudo if the backend changed).
-
-To take just the Preview printer back out (keeping imv, Files and Open with):
+Older versions could add a **Preview** printer that caught every app's
+`Ctrl+P → Print`. That's gone; if you set it up, take it out with:
 
 ```bash
 ~/.local/share/omarchy-print-preview/install.sh --no-printer
@@ -95,8 +70,8 @@ To take just the Preview printer back out (keeping imv, Files and Open with):
 ```
 
 This puts back the `Ctrl+P` line imv had before (yours, or Omarchy's), your
-previous default printer and any previous GTK preview command, and removes the
-window rules, links and the Preview printer. The libraries stay installed.
+previous GTK preview command, and removes the window rules, the `Ctrl+P`
+binding, the links and any old Preview printer. The libraries stay installed.
 
 ## Keys
 
@@ -116,12 +91,13 @@ argument, so it can rescan and repoint the queue with `lpadmin`.
 ## Tests
 
 ```bash
-python3 tests.py
+cargo test
 ```
 
-The tests never print. They make their own sample files. The black-and-white
-and barcode tests need a black-only printer set up in CUPS, plus `zint` to
-generate a barcode (`sudo pacman -S zint`).
+The tests never print. They make their own sample files and use a stand-in
+203 dpi black-only label printer, so they don't need one set up. A few compare
+against Poppler's `pdfinfo`/`pdfimages`, and the barcode repair test uses
+`zint` to make a barcode (`sudo pacman -S zint`); those are skipped if missing.
 
 ## Notes
 
@@ -139,14 +115,12 @@ generate a barcode (`sudo pacman -S zint`).
 - The window floats centred at 760×820. Omarchy applies its slight window
   transparency before a rule can drop the tag, so the rule also sets
   `opacity = "1 1"`.
-- The Preview printer has a small PPD (`print-preview.ppd`: A4, Letter, A5,
-  4×6) instead of being a raw queue. Chromium's own print screen calls a raw
-  queue "not available" because it lists no paper sizes. The PPD passes PDF and
-  PostScript through untouched, so the preview still gets exactly what the app
-  sent. CUPS 2.4 marks PPDs as deprecated but still supports them.
-- To skip Chromium's print screen entirely, start Chromium with
-  `--kiosk-printing` (add it to `~/.config/chromium-flags.conf`) and give it the
-  policy `PrintPreviewUseSystemDefaultPrinter`. Ctrl+P, or a site's "Print
-  label" button, then goes straight into this preview.
+- Barcodes are read with [rxing](https://crates.io/crates/rxing) (a Rust port
+  of ZXing), limited to the kinds shipping labels use: Code 128/39/93, ITF,
+  EAN-13/UPC-A, QR, Data Matrix, PDF417, MaxiCode and Aztec. The short product
+  codes (UPC-E, EAN-8) are left out, as ordinary text can read as one.
+- Printers and their paper sizes are read from CUPS's web server on
+  localhost, because `lpstat` and `lpoptions` spend a second browsing the
+  network before they answer. The window opens in about half a second.
 
 Community project, not part of Omarchy. MIT licensed.

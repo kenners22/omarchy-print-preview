@@ -1,0 +1,19 @@
+[package]
+name = "print-preview"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cairo-rs = { version = "0.22.9", features = ["pdf", "png"] }
+gtk = { version = "0.11.5", package = "gtk4", features = ["v4_12"] }
+poppler-rs = { version = "0.26.0", features = ["v0_82"] }
+regex = "1.13.1"
+rxing = { version = "0.9.3", default-features = false, features = ["decoders", "multi_barcode_readers", "full_barcode_format_support", "encoding_rs"] }
+serde_json = "1.0.151"
+urlencoding = "2.1.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
